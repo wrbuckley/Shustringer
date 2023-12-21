@@ -5,632 +5,905 @@
 //
 //    This software computes 
 //
-//      the shortest subsequence that for any locus of a given symbol 
-//      sequence, is found exactly once within that symbol sequence.
+//      - the shortest subsequence that for any locus of a given symbol 
+//        sequence, is found exactly once within that symbol sequence.
 //
-// (C) 2013 - 2015 by William R. Buckley
+//      - those short subsequences that are not found within the symbol
+//        sequence.
+//
+//      - histograms for
+// 
+//                         symbol usage
+//                         run length for repeating symbols
+//                         nullomer length
+//                         shustring length
+//
+// (C) 2013 - 2023 by William R. Buckley
 //                    California Evolution Institute
 //                    wrb@calevinst.org
 //                    All Rights Reserved.
 //
 //  Change Log
-// =========================================================================================
+// ==============================================================================================
 //    date     who     what 
-// ========= ======= =======================================================================
-//  20151027   wrb   Adapted the GenomeQuadTree software, removed UDS and other code paths, 
-//                     to produce the SHUStringer sequence analysis tool.
-//  20151110   wrb   Completed translation of specific-case data structures (trees of nodes)
-//                     and their build routines, to a node generalised for 256 possible 
-//                     symbols and the corresponding set of build routines.
-//
+// ========= ======= ============================================================================
+//  20151027   wrb   Adapted the GenomeQuadTree software, removed UDS and other code paths, to produce the SHUStringer sequence analysis tool.
+//  20151110   wrb   Completed translation of specific-case data structures (trees of nodes) and their build routines, to a node generalised for 256 possible symbols and the corresponding set of 
+//                     build routines.
+//  20151203   wrb   Date of first satisfactory behavior over wide range of datasets.
+//  20160114   wrb   Eliminated node structure in favor of compile-tile allocated data areas, eliminated recursion, and so use hstgrm as a stack for suspended sorts, and added aliasing feature to 
+//                     speed computations over restricted symbol sets; reduces the number of bins that need to be checked during a sort, the empty bins are nullomers and the full bins are either 
+//                     shustrings, or they are suspended sorts.
+//  20160121   wrb   Completed detection and command-line reporting of nullomers, limited by a specified upper threshold; only shorter nullomers are reported.  Discovered that the increment on 
+//                     the sequence cap occurred too soon, the hint being that reported nullomers were off by one character.  Basically, the cap was incremented before being sorted on; the first 
+//                     character of each shustring was not used to sort the shustring.  Hence, while the lengths were correct, the nullomers were not.  Now, both are correct.  It seems this error 
+//                     likely came from a sequence of transitions, first from early Python prototypes, then to the two-technique approach, where the radix sort was first developed, and then into 
+//                     this current optimal expression of the technique.  Moved one line of code, and all is now sound.  Examined in detail the trace of this code, to verify the nature of the 
+//                     problem, and ensure its solution.
+//  20160208   wrb   Added distinguished symbol option; keeps such symbol out of nullomer computations and allows comparison between two or more symbol sequences.
+//  20160210   wrb   Added quiet options; prevents printing of the list of shustrings (-q) and nullomers (-p).
+//  20160427   wrb   Added symbol usage and nullomer length histograms.  Added output file (-o) option; histograms (.hist), nullomers (.nuls) and shustrings (.shus) are created by this option.
+//  20201025   wrb   Updated copywrite notices.
+//  20231010   wrb   Removed all references to a distinguished symbol.  Added support for generalised statistics over input data.  Improved timer report at end of routine Main().  Added 
+//                     global variables skipflag and translate, and output file type statistics (.stat); these are also created by the output file (-o) option.  Added variable usage, and 
+//                     removed unused global variables endtime, shustart, shustop, histstart, histstop, dsFlag, outfileflag, histogramflag, histsymbols, histnullomers, symbolCount, and xcld.  
+//                     Removed options c, j, and x.  Updated Help() text.  Cleaned up alot of technical debt.
+//  20231028   wrb   Added in the 'why' comments, an example of a Radix Sort to show how simple and straightforward it is to extract shustrings and nullomers from any sequence of data.  Added 
+//                     detailed reference to Haubold, et. al. and demonstrated simplicity of our current method to their method.  Added code to implement Generalised Statistics Analysis of 
+//                     sequence under examination.
+//  20231113   wrb   Added code to compute two symbol (Pairings - subsequences of length two), one repeat of two symbols (Doubles - subsequences of length four), two repeats of two symbols 
+//                     (Triples - subsequences of length six), and three repeats of two symbols (Quadruples - subsequences of length eight).  Part of Generalised Statistics.
+//  20231209   wrb   Added statement respecting the notion of "An Experiment Addressing the Design of Software Editors."
+//  20231210   wrb   Fine corrections to commentary.
+//  20231217   wrb   Removed maxnullen.  Added radix.
 //   endlog
-
-#include      "stdafx.h"
-
-#include       <stdio.h>
-#include      <stdlib.h>
-#include      <string.h>
-#include       <ctype.h>
-#include        <time.h>
-#include        <math.h>
-
-#include      "getopt.h"
-
-#define MAXSEQUENCELENGTH  100000000                                                                        // One Hundred Million entries
-#define HSTFINALREPORT1    "================================\n\n"                                           //
-#define HSTTITLE1          "\n   Shustring Length Histogram\n================================\n"            //
-#define HSTTITLE2          "       length          count\n      --------      ---------\n"                  //
-                                                                                                            //
-enum machinestates {START, AGAIN, NEXT};                                                                    //
-                                                                                                            //
-typedef struct bytenode {                                                                                   //
-       struct bytenode *    lnk;                                                                            //
-       signed int           lst[256];                                                                       //
-     unsigned int           cnt[256];                                                                       //
-}                                                                                                           //
-bytnode;                                                                                                    //
-                                                                                                            //
-    unsigned char    sequen[MAXSEQUENCELENGTH];                                                             // <     c            >    symbol - actually, a character (byte) converted to int by sign extension - characters are unsigned octets
-      signed int     seqnxt[MAXSEQUENCELENGTH];                                                             // <  next            >    index of     next tile in candidate UDS
-    unsigned int     seqcap[MAXSEQUENCELENGTH];                                                             // <  disp, cap, len  >    far end of shustring; length of shustring = seqcap[i] - i
-                                                                                                            //
-    unsigned int     hstgrm[MAXSEQUENCELENGTH];                                                             //
-    unsigned int     hstrjct;                                                                               //
-    unsigned int     hsttot;                                                                                //
-                                                                                                            //
-    FILE           * seq;                                                                                   // Source file of genomic data
-    FILE           * rpt;                                                                                   // CSV file listing locus and length of each unique sequence
-                                                                                                            //
-    bytnode        * freelist;                                                                              //
-    bytnode        * bytree;                                                                                //
-    bytnode        * bytreelist;                                                                            //
-                                                                                                            //                           
-    time_t           starttime      = 0;                                                                    // time of entry-point execution                                                              Performance Metrics            
-    time_t           loadtime       = 0;                                                                    //
-    time_t           treetime       = 0;                                                                    //
-    time_t           generatetime   = 0;                                                                    //
-    time_t           endtime        = 0;                                                                    //
-    time_t           shustart       = 0;                                                                    //
-    time_t           shustop        = 0;                                                                    //
-    time_t           histstart      = 0;                                                                    //
-    time_t           histstop       = 0;                                                                    //
-                                                                                                            //
-      signed int     threshold      = 0;                                                                    // 
-                                                                                                            //
-    unsigned int     treealloc      = 0;                                                                    // 
-    unsigned int     maxalloc       = 0;                                                                    // 
-    unsigned int     notfound       = 0;                                                                    // Report on missing shustrings
-    unsigned int     kindflag       = 0;                                                                    // 
-    unsigned int     shustringflag  = 0;                                                                    // Generate shustrings for symbol sequence
-    unsigned int     outfileflag    = 0;                                                                    // 
-    unsigned int     histogramflag  = 0;                                                                    // Generate histogram for symbol sequence or shustrings
-    unsigned int     symbollistflag = 0;                                                                    //
-    unsigned int     thresholdflag  = 0;                                                                    //
-    unsigned int     operationCode  = 0;                                                                    //
-    unsigned int     sequenceLength = 0;                                                                    //
-    unsigned int     nodecount      = 0;
-                                                                                                            //
-             char    seqfname[257];                                                                         //
-             char    rptfname[257];                                                                         //
-             char    outfname[257];                                                                         //
-                                                                                                            //
-int arg_to_int(const char* arg, int min, int max, int defalt, int test){                                    // arg     - string to be converted
-    int rv, i = defalt;                                                                                     // min/max - the minimum/maximum allowed value, inclusive
-	                                                                                                        // defalt  - the default value, in case of an error
-                                                                                                            // test    - flag to perform bounds checking on conversion result
-    if(!arg) return defalt;                                                                                 // no argument means we use the default value
-    rv = sscanf(arg, "%d", &i);                                                                             // make sure we got an integer argument
-    if(rv != 1) return defalt;                                                                              // on scan error, return the default value
-    if(test != 0){                                                                                          // on test request -
-        if(i < min || max < i){                                                                             //   make sure the integer argument is within the desired range
-            return defalt;}}                                                                                //   - return default otherwise
-	return i;}                                                                                              // on all conditions satisfied, return converted result
-
-void about(void){
-    printf(
-    "\n\nMeasurement of relative distinction between subsequences\n"
-    "found within a sequence of symbols is the primary measure\n"
-    "provided by the SHUStringer computation tool.  SHUStringer\n"
-    "compares all regions of the sequence to all other regions of\n"
-    "the sequence and computes the length of subsequence beginning\n"
-    "at each locus such that the subsequence is distinct form the\n"
-    "subsequences so computed for all other loci.  Hence, the length\n"
-    "measure serves as a crude indicator of relative distinction\n"
-    "between regions of a sequence of symbols.\n"
-    );}
-
-void copyright(void){
-	printf(
-    "\nSHUStringer v1.0.0\n"
-    "Copyright (C) 2013, 2014 & 2015 by William R. Buckley\n"
-    "California Evolution Institute\n"
-    "All Rights Reserved\n\n"
-    );}
-
-void help(void){
-	printf(
-    "Usage: shus <option list> <filename>\n\n"
-    "   Operations:\n"
-    " ----------------------------------------------------------------------------\n"
-    "   -j                      generate histogram of shustring lengths\n"
-    "   -n                      report on shustrings that are not found\n"
-    "   -o <filename>           set name of output file\n"
-    "   -s                      generate symbol list\n"
-     "\n"
-   "   Parameters:\n"
-    " ----------------------------------------------------------------------------\n"
-    "   -k                      kind of histogram - 0 for shustrings (default)\n"
-    "                                               1 for symbols\n"
-    "   -r                      replace existing output file\n"
-    "   -t <count>              output shustrings longer(+) or shorter(-)\n"
-    "                             than the <count> threshold\n"
-        "\n"
-    "   Commentaries: NB - use of these options brings an immediate exit from shus\n"
-    " ----------------------------------------------------------------------------\n"
-    "   -a                      about this software\n"
-    "   -h                      help menu (this message list)\n"
-    "   -l                      license information\n"
-    //"   -m                      print a shus user's manual\n"
-    "\n"
-    "   Warnings!\n"
-    " ----------------------------------------------------------------------------\n\n"
-    "   Maximum Sequence Length is %d symbols\n\n"
-    "   <count> is a positive integer value\n\n\n",MAXSEQUENCELENGTH
-    );}
-
-void license(void){
-	printf(
-    "The rights statement of William R. Buckley:\n"
-    "===========================================\n"
-    "THIS SOFTWARE IS A COPYRIGHTED WORK AND MAY NOT BE REDISTRIBUTED\n"
-    "WITHOUT THE EXPRESS WRITTEN PERMISSION OF THE AUTHOR.\n\n\n"
-    "Portions of this software are\n"
-    "Copyright (c)2002-2003 Mark K. Kim\n"
-    "All rights reserved.\n"
-    "\n"
-    "The rights statement of Mark K. Kim:\n"
-    "------------------------------------\n"
-    " Redistribution and use in source and binary forms, with or without\n"
-    " modification, are permitted provided that the following conditions\n"
-    " are met:\n"
-    "\n"
-    "   * Redistributions of source code must retain the above copyright\n"
-    "     notice, this list of conditions and the following disclaimer.\n"
-    "\n"
-    "   * Redistributions in binary form must reproduce the above copyright\n"
-    "     notice, this list of conditions and the following disclaimer in\n"
-    "     the documentation and/or other materials provided with the\n"
-    "     distribution.\n"
-    "\n"
-    "   * Neither the original author of this software nor the names of its\n"
-    "     contributors may be used to endorse or promote products derived\n"
-    "     from this software without specific prior written permission.\n"
-    "\n"
-    " THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n"
-    " *AS IS* AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n"
-    " LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n"
-    " FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n"
-    " COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n"
-    " INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,\n"
-    " BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS\n"
-    " OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED\n"
-    " AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n"
-    " OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF\n"
-    " THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH\n"
-    " DAMAGE.\n"
-    );}
-                                                                                                            //
-void printbytnode(bytnode * r, unsigned int t, unsigned int op){
-    unsigned int   i,j,k;
-    unsigned int   s;
-
-    if(op == 1){
-        printf("printbytnode level %d r:%08x\n",t,r);
-        for(i=0;i<256;i++){
-            if(r->cnt[i] != 0){
-                printf("%3d.%10d  ",i,r->cnt[i]);
-                s = r->lst[i];
-                for(j=0;j<r->cnt[i];j++){
-                    printf("  %10d",s);
-                    s = seqnxt[s];
-                    if(j>9){
-                        j = r->cnt[i];
-                        printf("...\n");
-                    }
+                                                                                                                                                                                                       //
+#include      "stdafx.h"                                                                                                                                                                               //
+                                                                                                                                                                                                       //
+#include       <stdio.h>                                                                                                                                                                               //
+#include      <stdlib.h>                                                                                                                                                                               //
+#include      <string.h>                                                                                                                                                                               //
+#include       <ctype.h>                                                                                                                                                                               //
+#include        <time.h>                                                                                                                                                                               //
+#include        <math.h>                                                                                                                                                                               //
+                                                                                                                                                                                                       //
+#include      "getopt.h"                                                                                                                                                                               //
+                                                                                                                                                                                                       //
+#define MAXSEQUENCELENGTH     25000000                                                                                                                                                                 // Twenty Five Million entries.                                                               Longest servicable sequence is 25,000,000 binary octets.
+#define MAXNULLHIST           10001                                                                                                                                                                    // Index Origin is 1; last element holds count of over-length nullomers.
+#define MAXRUNHIST            10001                                                                                                                                                                    // Index Origin is 1; last element holds count of over-length runs.
+                                                                                                                                                                                                       //
+#define NULHSTTITLE1          "\n   Nullomer Length Histogram\n================================\n"                                                                                                     //
+#define NULHSTTITLE2          "       length          count\n      --------      ---------\n"                                                                                                          //
+#define NULHSTFOOTER          "\n================================\n\n"                                                                                                                                 //
+#define SYMHSTTITLE1          "\n     Symbol Usage Histogram\n================================\n"                                                                                                      //
+#define SYMHSTTITLE2          "       symbol          count\n      --------      ---------\n"                                                                                                          //
+#define SYMHSTFOOTER          "\n================================\n\n"                                                                                                                                 //
+#define SHUHSTFINALREPORT1    "================================\n\n"                                                                                                                                   //
+#define SHUHSTTITLE1          "\n   Shustring Length Histogram\n================================\n"                                                                                                    //
+#define SHUHSTTITLE2          "       length          count\n      --------      ---------\n"                                                                                                          //
+#define OUTRPT1               "%12d,%12d,%02x,%c\n"                                                                                                                                                    //
+#define OUTRPT2               "%12d,%12d,%02x\n"                                                                                                                                                       //
+#define ERRRPT                "Error opening output file:.%s.\n"                                                                                                                                       //
+                                                                                                                                                                                                       //
+       signed int    lst[256];                                                                                                                                                                         // An array of bins, in which to place sorted caps.
+     unsigned int    cnt[256];                                                                                                                                                                         // An array of counters, to keep track of how many caps are in the corresponding bin.         NB - the more bins that are used, the longer is the computation time; hence, aliasing.
+                                                                                                                                                                                                       //
+    unsigned char    sequen[MAXSEQUENCELENGTH];                                                                                                                                                        // symbol - an array of unsigned binary octets.
+      signed int     seqnxt[MAXSEQUENCELENGTH];                                                                                                                                                        // next   - pointer to next symbol in a list of symbols.                                      The effect of this software is to convert a single list of elements into a series of single element lists.
+    unsigned int     seqcap[MAXSEQUENCELENGTH];                                                                                                                                                        // cap    - pointer to the last symbol of a shustring; length of 
+                                                                                                                                                                                                       //            shustring[i] = seqcap[i] - i.
+      signed int     hstgrm[MAXSEQUENCELENGTH];                                                                                                                                                        // Used as stack space during shustring computation.                                          Replaces multiple node allocation.
+      signed int     hstrjct;                                                                                                                                                                          //
+      signed int     hsttot;                                                                                                                                                                           // Used as top-of-stack pointer during shustring computation.
+                                                                                                                                                                                                       //
+    unsigned int     hstnul[MAXNULLHIST];                                                                                                                                                              // Array of length - datastore for generating nullomer length histogram.
+                                                                                                                                                                                                       //
+    unsigned int     runhst[256][MAXRUNHIST];                                                                                                                                                          //
+                                                                                                                                                                                                       //
+    unsigned int     pairs[65536];                                                                                                                                                                     // Basis metric for Pairing, Tripling, and Double (Pairing, Tripling) Histograms.
+                                                                                                                                                                                                       //
+    FILE           * fseq;                                                                                                                                                                             // Source file of genomic data.
+    FILE           * fshu;                                                                                                                                                                             // CSV file listing locus and length of each shustring.
+    FILE           * fnul;                                                                                                                                                                             // A file listing all nullomers.
+    FILE           * fhst;                                                                                                                                                                             // A file listing all histograms.
+    FILE           * fstt;                                                                                                                                                                             // A file listing statistics.
+                                                                                                                                                                                                       //
+    time_t           starttime      = 0;                                                                                                                                                               // time of entry-point execution.                                                             Performance Metrics.            
+    time_t           loadtime       = 0;                                                                                                                                                               // time of start of loading of data to be analysed.
+    time_t           treetime       = 0;                                                                                                                                                               // time of start of data analysis.
+    time_t           generatetime   = 0;                                                                                                                                                               // time of start of data output - report generation.
+                                                                                                                                                                                                       //
+    unsigned int     sequenceLength = 0;                                                                                                                                                               //
+    unsigned int     nextalias      = 0;                                                                                                                                                               //
+    unsigned int     nullomers      = 0;                                                                                                                                                               //
+    unsigned int     nlomrthreshold = 0;                                                                                                                                                               //
+    unsigned int     qquietflag     = 0;                                                                                                                                                               // Non-zero: suppress shustring print - does not affect histogram printing.
+    unsigned int     pquietflag     = 0;                                                                                                                                                               // Non-zero: suppress nullomer  print - does not affect histogram printing.
+    unsigned int     translate      = 0;                                                                                                                                                               //
+    unsigned int     radix          = 10;                                                                                                                                                              //
+    unsigned int     maxpair        = 0;                                                                                                                                                               //
+                                                                                                                                                                                                       //
+    unsigned short   mux[256];                                                                                                                                                                         //
+    unsigned short   dmx[256];                                                                                                                                                                         //
+    unsigned int     use[256];                                                                                                                                                                         // Array of count versus symbol - datastore for generating symbol usage histogram.
+    unsigned int     usage[10001];                                                                                                                                                                     // Array of count versus repetition of symbol/symbol list; 10,001st element is a 
+                                                                                                                                                                                                       //   count of all repetitions longer than 10,000.
+             char    seqfname[257];                                                                                                                                                                    // Input data source - stream of sequence to be analysed.
+             char    hstfname[257];                                                                                                                                                                    // Metrics (like histograms) regarding analysed sequence.
+             char    shufname[257];                                                                                                                                                                    // List of shustrings found to occur within analysed sequence.
+             char    nulfname[257];                                                                                                                                                                    // List of nullomers found to occur within analysed sequence.
+             char    statname[257];                                                                                                                                                                    // Statictics List.
+                                                                                                                                                                                                       //
+             char    buffer[32];                                                                                                                                                                       //
+                                                                                                                                                                                                       //
+int arg_to_int(const char* arg, int min, int max, int default, int test){                                                                                                                              // arg     - string to be converted.
+    int rv, i = default;                                                                                                                                                                               // min/max - the minimum/maximum allowed value, inclusive.
+                                                                                                                                                                                                       // default - the default value, in case of an error.
+                                                                                                                                                                                                       // test    - flag to perform bounds checking on conversion result.
+    if(!arg) return default;                                                                                                                                                                           // No argument means we use the default value.
+    rv = sscanf(arg, "%d", &i);                                                                                                                                                                        // Make sure we got an integer argument.
+    if(rv != 1) return default;                                                                                                                                                                        // On scan error, return the default value.
+    if(test != 0){                                                                                                                                                                                     // On test request -
+        if(i < min || max < i){                                                                                                                                                                        //   make sure the integer argument is within the desired range;
+            return default;}}                                                                                                                                                                          //   return default otherwise.
+	return i;}                                                                                                                                                                                         // On all conditions satisfied, return converted result.
+                                                                                                                                                                                                       //
+const char* formatNumber(int value, char* endOfbuffer, bool plus) {                                                                                                                                    // This routine lifted from StackOverflow - see this discussion:
+    int neg = 0;                                                                                                                                                                                       //
+    int charCount = -1;                                                                                                                                                                                //   http://stackoverflow.com/questions/1449805/how-to-format-a-number-from-1123456789-to-1-123-456-789-in-c
+                                                                                                                                                                                                       //
+    if (value < 0) {                                                                                                                                                                                   //
+        value = -value;                                                                                                                                                                                //
+        neg = 1;                                                                                                                                                                                       //
+    }                                                                                                                                                                                                  //
+    *--endOfbuffer = 0;                                                                                                                                                                                //
+    do {                                                                                                                                                                                               //
+        if (++charCount == 3) {                                                                                                                                                                        //
+            charCount = 0;                                                                                                                                                                             //
+            *--endOfbuffer = ',';                                                                                                                                                                      //
+        }                                                                                                                                                                                              //
+        *--endOfbuffer = (char)(value % 10 + '0');                                                                                                                                                     //
+    }                                                                                                                                                                                                  //
+    while ((value /= 10) != 0);                                                                                                                                                                        //
+    if (neg)                                                                                                                                                                                           //
+        *--endOfbuffer = '-';                                                                                                                                                                          //
+    else if (plus)                                                                                                                                                                                     //
+        *--endOfbuffer = '+';                                                                                                                                                                          //
+    return endOfbuffer;                                                                                                                                                                                //                                                                                            Abstract Demonstration of Radix Sort, and the Generation of Shustrings and Nullomers                                                                                                                                                                       An Experiment Addressing the Design of Software Editors
+}                                                                                                                                                                                                      //                                                                                            ====================================================================================                                                                                                                                                                       =======================================================
+                                                                                                                                                                                                       //
+void about(void) {                                                                                                                                                                                     //                                                                                            The generation of shustrings from a sequence is very easy to demonstrate, and in doing so, we                                                                                                                                                              Early in my career as a software programmer, I came to learn about such design documents as the 
+    printf(                                                                                                                                                                                            //                                                                                              have opportunity to assist others to understand the design and operation of the software that                                                                                                                                                              Software Specification and the Configuration Items that come out of the specification.  It has
+        "\n  Measurement of relative distinction between subsequences\n"                                                                                                                               //                                                                                              we call Shustringer.  Consider the following sequence (NB - index origin is zero):                                                                                                                                                                         long concerned me that software editors do not work in the fashion that is so familiar to users                      
+        "  found within a sequence of symbols is the primary measure\n"                                                                                                                                //                                                                                                                                                                                                                                                                                                                                                         of file browsers, like the MS Windows File Explorer.  This is to say, there is no equivalent of 
+        "  provided by the SHUStringer computation tool.  SHUStringer\n"                                                                                                                               //                                                                                                                                 asassaasasdaadaaassasd                                                                                                                                                                                                  the File Explorer "Drill-Down."  One cannot start editing the Software Specification, and from 
+        "  compares all regions of the sequence to all other regions of\n"                                                                                                                             //                                                                                                                                                                                                                                                                                                                                                         that drill-down to a line of text that refers solely to a single Configuration Item.
+        "  the sequence and computes the length of subsequence beginning\n"                                                                                                                            //                                                                                            We see that this sequence includes only three symbols (or characters) in the alphabet.  So, 
+        "  at each locus such that the subsequence is distinct from the\n"                                                                                                                             //                                                                                              we need therefore only three bins in which to store records respecting the symbols of the                                                                                                                                                                I hold that, were it the case that software editors began the code generation process with the 
+        "  subsequences so computed for all other loci.  Hence, the length\n"                                                                                                                          //                                                                                              sequence.  We will label the first set of three bins with the letters A, D, and S.  Each of                                                                                                                                                                all important Software Specification, and with successive refinements, thereby write all of the 
+        "  measure serves as a crude indicator of relative distinction\n"                                                                                                                              //                                                                                              these bins will hold records that describe 1) the position of a symbol, and 2) the length of                                                                                                                                                               lines of new software within a single file.
+        "  between all regions of a sequence of symbols.\n\n"                                                                                                                                          //                                                                                              a subsequence that begins with the symbol.  When buildbytroot() executes, it generates a list
+        "  SHUStringer assumes that every symbol (byte) of the input\n"                                                                                                                                //                                                                                              of the symbols.  Then, buildbytree() describes each symbol in that list, and places those                                                                                                                                                                Contemporary software editors do not work in this fashion but, there is no logical reason that
+        "  stream is part of the sequence that is to be analysed;\n"                                                                                                                                   //                                                                                              descriptions in corresponding bins.  Upon ending the first pass of buildbytree(), the bins                                                                                                                                                                 software editors cannot work in this fashion.
+        "  i.e., that the input stream contains no metadata.\n\n");                                                                                                                                    //                                                                                              look as follows:
+}                                                                                                                                                                                                      //                                                                                                                                                                                                                                                                                                                                                       The extra commenting found in this file of source code is intended to introduce then notion of 
+                                                                                                                                                                                                       //                                                                                              1 Bin A: { <0,1>  <2,1>  <5,1>  <6,1>  <8,1>  <11,1>  <12,1>  <14,1>  <15,1>  <16,1>  <19,1> }                                                                                                                                                               higher-order software editors to software developers and their managers.
+void copyright(void) {                                                                                                                                                                                 //                                                                                              1 Bin D: {                                    <10,1>  <13,1>  <21,1>                         }
+    printf(                                                                                                                                                                                            //                                                                                              1 Bin S: { <1,1>  <3,1>  <4,1>  <7,1>  <9,1>  <17,1>  <18,1>  <20,1>                         }
+        "\nSHUStringer v1.5.0\n"                                                                                                                                                                       //
+        "Copyright (C) 2013-2023 by William R. Buckley\n"                                                                                                                                              //                                                                                            Each of these bins is then processed by a separate pass of buildbytree().  So, the above bins 
+        "California Evolution Institute\n"                                                                                                                                                             //                                                                                              should be thought of as Pass 1 Bin A, Pass 1 Bin D, and Pass 1 Bin S.
+        "All Rights Reserved\n\n");                                                                                                                                                                    //
+}                                                                                                                                                                                                      //                                                                                            Let us now see how buildbytroot handles the description records in Bin A.  The second pass 
+                                                                                                                                                                                                       //                                                                                              again distributes the description records found in Pass 1 Bin A to three new bins, labeled as
+void help(void) {                                                                                                                                                                                      //                                                                                              Pass 2 Bin A, Pass 2 Bin D, and Pass 2 Bin S.  The new distribution is as follows:
+    printf(                                                                                                                                                                                            //
+        "Usage: shus <option list> <filename>\n\n"                                                                                                                                                     //                                                                                              2 Bin A: {                      <5,2>  <11,2>  <14,2>  <15,2> }
+        "   Operations:\n"                                                                                                                                                                             //                                                                                              2 Bin D: {                             <12,2>                 }
+        " ----------------------------------------------------------------------------\n"                                                                                                              //                                                                                              2 Bin S: { <0,2>  <2,2>  <6,2>  <8,2>  <16,2>  <19,2>         }
+        "   -n <count>              generate nullomers of <count> length and shorter\n"                                                                                                                //
+        "   -o <filename>           name of file that is to receive program output\n"                                                                                                                  //                                                                                            Here we see that Bin D contains only one description record.  Hence, it describes a shustring.
+        "   -p                      prevents printing of histograms\n"                                                                                                                                 //                                                                                              The shustring is 'ad' and it occurs in only one place in the sequence; at character positions
+        "   -q                      prevents printing of nullomers and shustrings\n"                                                                                                                   //                                                                                              12 and 13.  Therefore, the record in Pass 2 Bin D does not need to be processed by a third pass 
+        "   -r <value>              specify value of relevant radix\n"                                                                                                                                 //                                                                                              of buildbytree().
+        "\n"                                                                                                                                                                                           //                                                                                            
+        "   Commentaries: NB - use of these options brings an immediate exit from shus\n"                                                                                                              //
+        " ----------------------------------------------------------------------------\n"                                                                                                              //                                                                                            When at the end of a pass of buildbytree() it happens that a bin is empty of description 
+        "   -a                      about this software\n"                                                                                                                                             //                                                                                              records, then a nullomer has been found.
+        "   -h                      help menu (this message list)\n"                                                                                                                                   //
+        "   -l                      license information\n"                                                                                                                                             //                                                                                            So, we see that the extraction of shustrings and nullomers from a sequence by the action of a
+        "\n"                                                                                                                                                                                           //                                                                                              Radix Sort [as implemented by buildbytree()] is both simple and straightforward.
+        "   Warnings!\n"                                                                                                                                                                               //
+        " ----------------------------------------------------------------------------\n\n"                                                                                                            //
+        "   If the -o parameter is given, then program output is written to files\n"                                                                                                                   //
+        "   that have names ending with extensions\n\n"                                                                                                                                                //
+        "                   Histograms                 .hist\n"                                                                                                                                        // histogram(s)
+        "                   Nullomers                  .nuls\n"                                                                                                                                        // nullomers
+        "                   Shustrings                 .shus\n"                                                                                                                                        // shustrings
+        "                   Statistics                 .stat\n\n"                                                                                                                                      // general statisics and metrics
+        "   <count> is a positive integer value\n"                                                                                                                                                     //
+        "   Maximum Sequence Length is %s symbols\n\n", formatNumber(MAXSEQUENCELENGTH, buffer + 32, false));                                                                                          //
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+void license(void) {                                                                                                                                                                                   //                                                                                            NB: In this file, I demonstrate a method of commenting that is quite different from that
+    printf(                                                                                                                                                                                            //                                                                                              which is typically demonstrated in software code.  The point is that what is at left is 
+        "The rights statement of William R. Buckley:\n"                                                                                                                                                //                                                                                              the how of the software.  The next right comments address the purpose of the code; what 
+        "===========================================\n"                                                                                                                                                //                                                                                              is the intended output, and what are the details of the algorithm that facilitate the 
+        "THIS SOFTWARE IS A COPYRIGHTED WORK AND MAY NOT BE REDISTRIBUTED\n"                                                                                                                           //                                                                                              generation of intended output.  The next right column addresses the relationship of the 
+        "WITHOUT THE EXPRESS WRITTEN PERMISSION OF THE AUTHOR.\n\n\n"                                                                                                                                  //                                                                                              software code (and its design) to some real-world task that is to be satisfied.  In the 
+        "Portions of this software are\n"                                                                                                                                                              //                                                                                              present case, the point is to compute shustrings in a fashion that requires only the
+        "Copyright (c)2002-2003 Mark K. Kim\n"                                                                                                                                                         //                                                                                              provision of a full genome assembly.  This is the problem that I have with the Haubold
+        "All rights reserved.\n"                                                                                                                                                                       //                                                                                              solution, in that it requires access to more complicated means of representing genomic 
+        "\n"                                                                                                                                                                                           //                                                                                              data, vis-a-vis a Suffix Tree.  In point of fact, one need only the complete genome assembly 
+        "The rights statement of Mark K. Kim:\n"                                                                                                                                                       //                                                                                              in order to extract shustrings, and this seems to be a point missing in the Haubold analysis.
+        "------------------------------------\n"                                                                                                                                                       //
+        " Redistribution and use in source and binary forms, with or without\n"                                                                                                                        //                                                                                            In addition, this implementation includes the detailed code that outputs nullomer data; the 
+        " modification, are permitted provided that the following conditions\n"                                                                                                                        //                                                                                              previous public release of Shustringer provided a place from which such data is able to be 
+        " are met:\n"                                                                                                                                                                                  //                                                                                              output but did not explicitly include code to 'print' that data.  The expectation of this 
+        "\n"                                                                                                                                                                                           //                                                                                              author is that, if people want to have software that produces nullomers and shustrings, then 
+        "   * Redistributions of source code must retain the above copyright\n"                                                                                                                        //                                                                                              those people should become familiar with my code, and add the missing 'print' statements.
+        "     notice, this list of conditions and the following disclaimer.\n"                                                                                                                         //                                                                                              In this case, I am relenting my expectation, and showing all those who could not follow my 
+        "\n"                                                                                                                                                                                           //                                                                                              code, just how simple it is to add to the output of shustringer code sufficient to the 
+        "   * Redistributions in binary form must reproduce the above copyright\n"                                                                                                                     //                                                                                              display of nullomer data.
+        "     notice, this list of conditions and the following disclaimer in\n"                                                                                                                       //
+        "     the documentation and/or other materials provided with the\n"                                                                                                                            //                                                                                            So, a good part of the value of the code presented in this file relates to a 'Modern' notion
+        "     distribution.\n"                                                                                                                                                                         //                                                                                              of proper comment.  There is the 'how' (left most commentary) and the 'purpose' (or, 
+        "\n"                                                                                                                                                                                           //                                                                                              'what we intend to obtain from existing data.'), and the 'why' in the next right-most 
+        "   * Neither the original author of this software nor the names of its\n"                                                                                                                     //                                                                                              commentary.  Finally, at the right of these comments, comes the relationship with other 
+        "     contributors may be used to endorse or promote products derived\n"                                                                                                                       //                                                                                              processes.
+        "     from this software without specific prior written permission.\n"                                                                                                                         //
+        "\n"                                                                                                                                                                                           //                                                                                            I have fervently worked to produce coded examples of software that substantially demonstrate 
+        " THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n"                                                                                                                       //                                                                                              the value of multi-level commenting of code.  I hold that it is not enough to rely upon syntax 
+        " *AS IS* AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n"                                                                                                                         //                                                                                              and semantics to properly document the function that is obtained by execution of a computer 
+        " LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS\n"                                                                                                                         //                                                                                              program.  The code and comments related to the generation of shustrings by the execution of 
+        " FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE\n"                                                                                                                            //                                                                                              Shustringer upon given and detailed data of a KNOWN genome, are very well placed to help readers 
+        " COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,\n"                                                                                                                       //                                                                                              to understand the details of this codes execution, and thus the propriety of generated data.
+        " INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,\n"                                                                                                                      //
+        " BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS\n"                                                                                                                     //                                                                                            I have been writing software since 1972.  It is now 2023.  That means I have been writing 
+        " OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED\n"                                                                                                                        //                                                                                              software for at least 51 years.  I know poorly documented software when I see it, and my 
+        " AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,\n"                                                                                                                    //                                                                                              goal with these statements is to convince the reader of the efficacy of my method of expressing
+        " OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF\n"                                                                                                                     //                                                                                              the detailed documentation of the function, methods, and utility of code.
+        " THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH\n"                                                                                                                      //
+        " DAMAGE.\n"                                                                                                                                                                                   //                                                                                            So, the layers are how, why, relationship to other processes, and at the top level, relationship
+    );                                                                                                                                                                                                 //                                                                                              to the work of other researchers.  If you cannot write documentation for software at this level 
+}                                                                                                                                                                                                      //                                                                                              of detail, you do not belong in the business!
+                                                                                                                                                                                                       //
+void buildbytroot(void) {                                                                                                                                                                              //                                                                                            This routine builds a single suspended sort.                                                               The origin of the concept of a 'shustring' is the paper 'Genome Comparison Without Alignment Using Shortest Unique Substrings,' as                                                                                                               
+    unsigned int    i;                                                                                                                                                                                 // i - an index on the sequence; j - count of bytes of a single value in a run.                 buildbytroot() and buildbytree() operate as a pair on a set of global data areas, the sequence             published in BMC Bioinformatics, 2005 May 23:6 : 123.  doi : 10.1186 / 1471 - 2105 - 6 - 123. written by Haubold, et. al.  See the            
+    unsigned char   c;                                                                                                                                                                                 // c - the i'th character of the sequence.                                                      of symbols <sequen>, a set of pointers to the next element of a list of symbols <seqnxt>, a set            internet: https://pubmed.ncbi.nlm.nih.gov/15910684/
+                                                                                                                                                                                                       //                                                                                              of pointers to the current 'cap' of a shustring <seqcap>, and a set of integers that are used as 
+                                                                                                                                                                                                       //                                                                                              counters in the generation of histographic analysis of shustring lengths <hstgrm>.  These data 
+    lst[0] = -1;                                                                                                                                                                                       // lst[0] is where the first suspended sort is built; -1 means Not Yet Built.                   areas have associated index variables, like the total number of elements in the histogram <hsttot>
+    cnt[0] = 0;                                                                                                                                                                                        // cnt[0] is the length of this suspended sort, in units of symbols.                            and the number of elements that were rejected from inclusion in the histogram <hstrjt>.
+    if (0 == fseek(fseq, 0L, SEEK_SET)) {                                                                                                                                                              // Seek to beginning of sequence.                                                               buildbytroot() builds a proper initial state to all these variables, and then
+        for (i = 0; i < MAXSEQUENCELENGTH; i++) seqnxt[i] = -1;                                                                                                                                        // Initialise seqnxt[]                                                                          buildbytree() is applied to those initial data in order to generate shustring and 
+        i = nextalias = 0;                                                                                                                                                                             //   and other variables.                                                                       nullomer data.  This is much more compact code than is the code of Haubold.  But then,
+        while (1) {                                                                                                                                                                                    // While symbols remain to be read from the sequence:                                           Haubold preserves the suffix tree/suffix array.
+            c = fgetc(fseq);                                                                                                                                                                           //   Get the next symbol of the sequence.                                                         
+            if (feof(fseq)) {                                                                                                                                                                          //   NB - The forever loop must eventually execute the following block.
+                sequenceLength = i;                                                                                                                                                                    // Note the sequence length.                                                                  This brings us to the topic of suffix tree generation, and retention of representation.  We expect
+                break;                                                                                                                                                                                 // Exit the routine.                                                                            that a careful understanding of the mechanisms of Haubold's code will provide good direction to 
+            }                                                                                                                                                                                          //                                                                                              alteration of this code, so that the suffix tree (or array) may be generated simultaneous with 
+            if (mux[(unsigned int)c] == 257) {                                                                                                                                                         // Build the symbol alias mapping.  Code translation occurs before any shustring                shustrings and nullomers.  Currently, that tree is represented in the form of suspended sorts,
+                mux[(unsigned int)c] = (unsigned short)nextalias;                                                                                                                                      //   search, and so is handled entirely within this routine - output of proper symbol,          and these are unorganised beyond their placement upon the stack.
+                dmx[nextalias++] = c;                                                                                                                                                                  //   instead of the alias, is accomplished in main().                                         
+            }                                                                                                                                                                                          //                                                                                            
+            c = (unsigned char)mux[(unsigned int)c];                                                                                                                                                   // Compute shustrings on the alias; it is more efficient in terms of bin searching.           
+            use[c]++;                                                                                                                                                                                  // Increment counter corresponding to the used symbol, post alias                             NB - This code does not use pointers.  Instead, it uses pseudo-pointers, and these are in the 
+            seqnxt[i] = lst[0];                                                                                                                                                                        //   build a single list of backward pointers (a LIFO), and so                                       form of indexes upon an array.  This is to say, we use array indicies as a means to construct 
+            lst[0] = i;                                                                                                                                                                                //   link all the symbols in a way serviced naturally by buildbytree().                              code that otherwise is suitable for the manipulation of pointers.  Thus, this code is just a  
+            cnt[0]++;                                                                                                                                                                                  // Increment the character count, to indicate the length of the list.                                little less efficient than it otherwise might be, such as by using real pointers instead of  
+            seqcap[i] = i;                                                                                                                                                                             // Set initial length of cap to zero - indicated by yield:  seqcap[i] - i.                           pseudo-pointers.  On the other hand, one expects that this code is easily adapted into solid   
+            sequen[i++] = c;                                                                                                                                                                           // Add character to sequence; keep track of the sequence length (symbol count).                      C# code.  We are interested to see how the two versions perform, relative to each other.
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    else {                                                                                                                                                                                             //
+        printf("\nSeek error on file: %s\n\n", seqfname);                                                                                                                                              // This is a catastrophic error, and
+        printf("       seek error on file: %s\n\n", seqfname);                                                                                                                                         //   |
+        exit(0);                                                                                                                                                                                       //   leads to termination of the task.
+    }                                                                                                                                                                                                  //
+}                                                                                                                                                                                                      //                                                                                            
+                                                                                                                                                                                                       //                                                                                            
+void buildbytree(signed int t) {                                                                                                                                                                       // t     - index of the first element of a suspended sort list                                This routine performs a sort and partition function, following the path of the suffix tree without
+    unsigned int   i, j, k, l, ii;                                                                                                                                                                     // i     - general index                                                                        actually constructing the tree; instead, the tree is represented in the set of suspended sorts
+    signed int   hold;                                                                                                                                                                                 // j,k,l - index of cap, cap, length - the length of a candidate shustring                      that are stored on the stack (implemented with the use of the hstgrm[] array).  By following this
+                                                                                                                                                                                                       // hold  - index to the next element of list                                                    path, this algorithm is able to find longest common prefixes, shustrings, and nullomers.
+    hsttot = 0;                                                                                                                                                                                        // Bottom of stack is element zero, and we use this to indicate function completion;            
+    for (i = 0; i < MAXNULLHIST; i++) hstnul[i] = 0;                                                                                                                                                   //   therefore, the bottom of stack is not used for noting incompletely sorted lists.
+    for (i = 0; i < nextalias; i++) {                                                                                                                                                                  //
+        lst[i] = -1;                                                                                                                                                                                   // For all <nextalias> bins, indicate an empty list and a zero count
+        cnt[i] = 0;                                                                                                                                                                                    //
+    }                                                                                                                                                                                                  //
+    do {                                                                                                                                                                                               //                                                                                            An incompletely sorted list is therefore in a state of suspended sort, and it is suspended that is
+        k = seqcap[t];                                                                                                                                                                                 // The cap (longest common prefix) is the same for all members of the list.                     obtained by knowing the first element of a list; i.e. an index.
+        l = k - t;                                                                                                                                                                                     // Compute the length of a shustring candidate.
+        j = t;                                                                                                                                                                                         //                                                                                              
+        while (t != -1) {                                                                                                                                                                              // So long as we have a valid index, we construct the node, resorting the list.               The entire sort is captured in this while() loop, a total of 14 lines of C code.
+            if ((seqcap[t] - t) < sequenceLength) {                                                                                                                                                    // No cap can exceed the length of the entire sequence.                                       The sort is according to the symbol located at the cap.
+                hold = seqnxt[t];                                                                                                                                                                      // Hold the index to the next element of the subsequence.
+                if (seqcap[t] < sequenceLength) {                                                                                                                                                      // If the cap length of subsequence t is less than the length of the entire sequence          The cap is a length plus the index of the cap.  It may easily in value exceed sequenceLength, 
+                    i = (unsigned int)sequen[seqcap[t]];                                                                                                                                               //   then we need make no adjustment to that cap length in order to use it as an index;         and this fact must be taken into account when conducting the sort.
+                }                                                                                                                                                                                      //   however,  if the cap length of the subsequence t is greater than or equal to the 
+                else {                                                                                                                                                                                 //   length of the entire sequence, then we do need to make an adjustment to the cap
+                    i = (unsigned int)sequen[(seqcap[t] - sequenceLength)];                                                                                                                            //   length in order to use it as an index.                                                   This is the case where the cap plus the index of the cap (the sum) has a value that is larger  
+                }                                                                                                                                                                                      //                                                                                              than is the value of the sequenceLength.
+                seqcap[t]++;                                                                                                                                                                           // Increase the cap length of subsequence t; do so ONLY AFTER sorting on the current cap.
+                seqnxt[t] = lst[i];                                                                                                                                                                    //
+                lst[i] = t;                                                                                                                                                                            // Add the subsequence to the list that corresponds to the symbol that is found at the        NB - we show here that variable i is defined, so that we know on which symbol the current 
+                cnt[i]++;                                                                                                                                                                              //   end of the subsequence.  Keep track of how many subsequences are in that list.             sort is to occur; lst[i] and cnt[i].
+                t = hold;                                                                                                                                                                              //
+            }                                                                                                                                                                                          //
+            else {                                                                                                                                                                                     //
+                t = seqnxt[t];                                                                                                                                                                         // Get next suspended sort.
+            }                                                                                                                                                                                          //
+        }                                                                                                                                                                                              // We are done computing this shustring; get the next candidate.
+        for (i = 0; i < nextalias; i++) {                                                                                                                                                              // For every bin, if the list has length greater than 1, put list on top of stack.            All of putting suspended sorts on the stack and detection of nullomers is captured
+            if (cnt[i] > 1) hstgrm[++hsttot] = lst[i];                                                                                                                                                 // For nullomers, if the cap is shorter than the threshold, report the sequence if the 
+            if (cnt[i] == 0) {                                                                                                                                                                         //   bin is empty, the cap plus one symbol.
+                if (l < (MAXNULLHIST - 1)) {                                                                                                                                                           //
+                    hstnul[(l + 1)]++;                                                                                                                                                                 // For all indices less than (MAXNULLHIST - 1), i.e. the closed interval [0,9999]:
+                }                                                                                                                                                                                      //   increment the count of nullomers of the indicated length.
+                else {                                                                                                                                                                                 //
+                    hstnul[MAXNULLHIST - 1]++;                                                                                                                                                         // For the index of (MAXNULLHIST - 1):
+                }                                                                                                                                                                                      //   increment the cound of nullomers that are strictly larger that (MAXNULLHIST - 1).
+                if (nullomers) {                                                                                                                                                                       //
+                    if (l <= nlomrthreshold) {                                                                                                                                                         // If the identified nullomer is below the selection threshold, record the nullomer.
+                        if (*nulfname) {                                                                                                                                                               // If a file has been specified, write the nullomer to the appropriate output file;
+                            for (ii = j; ii < k; ii++) fprintf(fnul, "%c", dmx[sequen[ii]]);                                                                                                           //   |
+                            fprintf(fnul, ".%c\n", dmx[i]);                                                                                                                                            //   |
+                        }                                                                                                                                                                              //   |
+                        else {                                                                                                                                                                         //   else, write the nullomer to the computer display.
+                            if (pquietflag == 0) {                                                                                                                                                     // The pquietflag overrides printing.
+                                for (ii = j; ii < k; ii++) printf("%c", dmx[sequen[ii]]);                                                                                                              //
+                                printf(".%c\n", dmx[i]);                                                                                                                                               //
+                            }                                                                                                                                                                          //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //
+            }                                                                                                                                                                                          //
+            cnt[i] = 0;                                                                                                                                                                                // Reset the counter and the list pointer for use on next suspended sort.
+            lst[i] = -1;                                                                                                                                                                               //
+        }                                                                                                                                                                                              //
+        if (hsttot > 0) t = hstgrm[hsttot];                                                                                                                                                            // If the stack is not empty, then get the list at the top of the stack and 
+    } while (hsttot-- > 0);                                                                                                                                                                            //   decrement the stack pointer; do this until the stack is empty.
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+void FindRuns() {                                                                                                                                                                                      //
+    unsigned int  i, j;                                                                                                                                                                                //
+    unsigned char c, d;                                                                                                                                                                                //
+                                                                                                                                                                                                       //
+    c = sequen[0];                                                                                                                                                                                     //
+    for (i = 0; i < 256; i++) {                                                                                                                                                                        //
+        for (j = 0; j < MAXRUNHIST; j++) {                                                                                                                                                             //
+            runhst[i][j] = 0;                                                                                                                                                                          //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    i = 1;                                                                                                                                                                                             //
+    for(j = 1; j < sequenceLength + 1; j++) {                                                                                                                                                          //
+        if (c == (d = sequen[j])) {                                                                                                                                                                    //
+            i++;                                                                                                                                                                                       //
+        }                                                                                                                                                                                              //
+        else {                                                                                                                                                                                         //
+            if (i < MAXRUNHIST - 1) {                                                                                                                                                                  //     If the run length is less than the value (MAXRUNHIST - 1):
+                runhst[c][i]++;                                                                                                                                                                        //       Increment the count of run length versus input character,
+            }                                                                                                                                                                                          //       |
+            else {                                                                                                                                                                                     //       |
+                runhst[c][MAXRUNHIST - 1]++;                                                                                                                                                           //       else, increment the count of over-length run versus the input character.
+            }                                                                                                                                                                                          //    
+            c = d;                                                                                                                                                                                     //
+            i = 1;                                                                                                                                                                                     //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+void ReportSimpleGrouping(unsigned int m) {                                                                                                                                                            //
+    unsigned int i, j, ia, ib, ic, id, ie, ig, ih, ik, t;                                                                                                                                              //
+                                                                                                                                                                                                       //
+    for (i = 0; i < 65536; i++) {                                                                                                                                                                      //
+        pairs[i] = 0;                                                                                                                                                                                  //
+    }                                                                                                                                                                                                  //
+    for (t = 0; t < sequenceLength; t++) {                                                                                                                                                             //
+        ia = (unsigned int)sequen[t % sequenceLength];                                                                                                                                                 //
+        ib = (unsigned int)sequen[(t + 1) % sequenceLength];                                                                                                                                           //
+        ic = (unsigned int)sequen[(t + 2) % sequenceLength];                                                                                                                                           //
+        id = (unsigned int)sequen[(t + 3) % sequenceLength];                                                                                                                                           //
+        ie = (unsigned int)sequen[(t + 4) % sequenceLength];                                                                                                                                           //
+        ig = (unsigned int)sequen[(t + 5) % sequenceLength];                                                                                                                                           //
+        ih = (unsigned int)sequen[(t + 6) % sequenceLength];                                                                                                                                           //
+        ik = (unsigned int)sequen[(t + 7) % sequenceLength];                                                                                                                                           //
+        switch (m) {                                                                                                                                                                                   //
+        case 1:                                                                                                                                                                                        // Pairs
+            if (ia == ib) {                                                                                                                                                                            //
+                pairs[(ia << 8) + ib]++;                                                                                                                                                               //
+            }                                                                                                                                                                                          //
+            break;                                                                                                                                                                                     //
+        case 2:                                                                                                                                                                                        // Doubles
+            if ((ia == ic) && (ib == id)) {                                                                                                                                                            //
+                pairs[(ia << 8) + ib]++;                                                                                                                                                               //
+            }                                                                                                                                                                                          //
+            break;                                                                                                                                                                                     //
+        case 3:                                                                                                                                                                                        // Triples
+            if ((ia == ic) && (ic == ie) && (ib == id) && (id == ig)) {                                                                                                                                //
+                pairs[(ia << 8) + ib]++;                                                                                                                                                               //
+            }                                                                                                                                                                                          //
+            break;                                                                                                                                                                                     //
+        case 4:                                                                                                                                                                                        // Quadruples
+            if (((ia == ic) && (ic == ie) && (ie == ih)) && ((ib == id) && (id == ig) && (ig == ik))) {                                                                                                //
+                pairs[(ia << 8) + ib]++;                                                                                                                                                               //
+            }                                                                                                                                                                                          //
+            break;                                                                                                                                                                                     //
+        default:                                                                                                                                                                                       //
+            break;                                                                                                                                                                                     //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    fprintf(fstt, "       ");                                                                                                                                                                          //
+    for (i = 0; i < nextalias; i++) {                                                                                                                                                                  //
+        fprintf(fstt, "%8x  ", dmx[i]);                                                                                                                                                                //
+    }                                                                                                                                                                                                  //
+    fprintf(fstt, "\n       ");                                                                                                                                                                        //
+    for (i = 0; i < nextalias; i++) {                                                                                                                                                                  //
+        fprintf(fstt, "--------  ");                                                                                                                                                                   //
+    }                                                                                                                                                                                                  //
+    fprintf(fstt, "\n\n");                                                                                                                                                                             //
+    for (i = 0; i < nextalias; i++) {                                                                                                                                                                  //
+        fprintf(fstt, "  %2x | ", dmx[i]);                                                                                                                                                             //
+        for (j = 0; j < nextalias; j++) {                                                                                                                                                              //
+            fprintf(fstt, "%8d  ", pairs[(i << 8) + j]);                                                                                                                                               //
+        }                                                                                                                                                                                              //
+        fprintf(fstt, "\n");                                                                                                                                                                           //
+    }                                                                                                                                                                                                  //
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+void printradix(unsigned int value, unsigned int len, unsigned int radix) {                                                                                                                            // Print Radix to File
+    char hold[10];                                                                                                                                                                                     //
+    int  t = 8;                                                                                                                                                                                        //
+    unsigned int  i, cnt;                                                                                                                                                                              //
+                                                                                                                                                                                                       //
+    for (i = 0; i < 10; i++) {                                                                                                                                                                         //
+        hold[i] = 0;                                                                                                                                                                                   //
+    }                                                                                                                                                                                                  //
+    cnt = 0;                                                                                                                                                                                           //
+    if (value != 0) {                                                                                                                                                                                  //
+        while (value != 0) {                                                                                                                                                                           //
+            cnt++;                                                                                                                                                                                     //
+            hold[t--] = value % radix;                                                                                                                                                                 //
+            value /= radix;                                                                                                                                                                            //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    else {                                                                                                                                                                                             //
+        cnt++;                                                                                                                                                                                         //
+        hold[t--] = value;                                                                                                                                                                             //
+    }                                                                                                                                                                                                  //
+    while (cnt < len) {                                                                                                                                                                                //
+        cnt++;                                                                                                                                                                                         //
+        hold[t--] = 0;                                                                                                                                                                                 //
+    }                                                                                                                                                                                                  //
+    i = 8 - t;                                                                                                                                                                                         //
+    if (i < 5) {                                                                                                                                                                                       //
+        for (; i < 5; i++) {                                                                                                                                                                           //
+            printf(" ");                                                                                                                                                                               //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    for (++t; t < 9; t++) {                                                                                                                                                                            //
+        printf("%1d", hold[t]);                                                                                                                                                                        //
+    }                                                                                                                                                                                                  //
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+void printradixf(unsigned int value, unsigned int len, unsigned int radix, FILE* fp) {                                                                                                                 // Print Radix to File
+    char hold[10];                                                                                                                                                                                     //
+    int  t = 8;                                                                                                                                                                                        //
+    unsigned int  i, cnt;                                                                                                                                                                              //
+                                                                                                                                                                                                       //
+    for (i = 0; i < 10; i++) {                                                                                                                                                                         //
+        hold[i] = 0;                                                                                                                                                                                   //
+    }                                                                                                                                                                                                  //
+    cnt = 0;                                                                                                                                                                                           //
+    if (value != 0) {                                                                                                                                                                                  //
+        while (value != 0) {                                                                                                                                                                           //
+            cnt++;                                                                                                                                                                                     //
+            hold[t--] = value % radix;                                                                                                                                                                 //
+            value /= radix;                                                                                                                                                                            //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    else {                                                                                                                                                                                             //
+        cnt++;                                                                                                                                                                                         //
+        hold[t--] = value;                                                                                                                                                                             //
+    }                                                                                                                                                                                                  //
+    while (cnt < len) {                                                                                                                                                                                //
+        cnt++;                                                                                                                                                                                         //
+        hold[t--] = 0;                                                                                                                                                                                 //
+    }                                                                                                                                                                                                  //
+    i = 8 - t;                                                                                                                                                                                         //
+    if (i < 5) {                                                                                                                                                                                       //
+        for (; i < 5; i++) {                                                                                                                                                                           //
+            fprintf(fp, " ");                                                                                                                                                                          //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    for (++t; t < 9; t++) {                                                                                                                                                                            //
+        fprintf(fp, "%1d", hold[t]);                                                                                                                                                                   //
+    }                                                                                                                                                                                                  //
+}                                                                                                                                                                                                      //
+                                                                                                                                                                                                       //
+int main(int argc, char* argv[], char** envp) {                                                                                                                                                        //
+    unsigned int   i, k, l, m, t, tt;                                                                                                                                                                  //
+                                                                                                                                                                                                       //
+    starttime = clock();                                                                                                                                                                               //
+    copyright();                                                                                                                                                                                       //
+    for (i = 0; i < 257; i++) *(seqfname + i) = *(hstfname + i) = *(shufname + i) = *(nulfname + i) = *(statname + i) = '\0';                                                                          //
+    for (i = 0; i < 256; i++) mux[i] = 257;                                                                                                                                                            // Mark the elements of the translation matrix to indicate non-use - any value outside 
+    while (1) {                                                                                                                                                                                        //   the interval [0..255] may be used as the indicator value, hence 257.
+        int c = getopt(argc, argv, "-ahlpqn:o:r:");                                                                                                                                                    // 
+        if (c == -1) break;                                                                                                                                                                            //
+        switch (c) {                                                                                                                                                                                   //
+        case 'a':                                                                                                                                                                                      //
+            about();                                                                                                                                                                                   //
+            exit(0);                                                                                                                                                                                   //
+        case 'h':                                                                                                                                                                                      //
+            help();                                                                                                                                                                                    //
+            exit(0);                                                                                                                                                                                   //
+        case 'l':                                                                                                                                                                                      //
+            license();                                                                                                                                                                                 //
+            exit(0);                                                                                                                                                                                   //
+        case 'n':                                                                                                                                                                                      //
+            nullomers = 1;                                                                                                                                                                             //
+            nlomrthreshold = (-1) + arg_to_int(optarg, 0, 0, 500, 0);                                                                                                                                  //
+            break;                                                                                                                                                                                     //
+        case 'o':                                                                                                                                                                                      //
+            strcpy(shufname, optarg);                                                                                                                                                                  //
+            strcat(shufname, ".shus");                                                                                                                                                                 //
+            strcpy(hstfname, optarg);                                                                                                                                                                  //
+            strcat(hstfname, ".hist");                                                                                                                                                                 //
+            strcpy(nulfname, optarg);                                                                                                                                                                  //
+            strcat(nulfname, ".nuls");                                                                                                                                                                 //
+            strcpy(statname, optarg);                                                                                                                                                                  //
+            strcat(statname, ".stat");                                                                                                                                                                 //
+            break;                                                                                                                                                                                     //
+        case 'p':                                                                                                                                                                                      //
+            pquietflag = 1;                                                                                                                                                                            //
+            break;                                                                                                                                                                                     //
+        case 'q':                                                                                                                                                                                      //
+            qquietflag = 1;                                                                                                                                                                            //
+            break;                                                                                                                                                                                     //
+        case 'r':                                                                                                                                                                                      //
+            radix = arg_to_int(optarg, 2, 16, 0, 0);                                                                                                                                                   //
+            break;                                                                                                                                                                                     //
+        case   1:                                                                                                                                                                                      //
+            strcpy(seqfname, optarg);                                                                                                                                                                  //
+            break;                                                                                                                                                                                     //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    if (*shufname) {                                                                                                                                                                                   // If output file name given via the -o command line parameter, then
+        if (0 == (fshu = fopen(shufname, "wb"))) {                                                                                                                                                     //   Create for output       |   Do these three operations for
+            printf("Can't open for create, file %s\n", shufname);                                                                                                                                      //   Report error            |   each of the three files that
+            exit(0);                                                                                                                                                                                   //   Quit on error detection |   are to be created.
+        }                                                                                                                                                                                              //
+        if (0 == (fhst = fopen(hstfname, "wb"))) {                                                                                                                                                     //
+            printf("Can't open for create, file %s\n", hstfname);                                                                                                                                      //
+            exit(0);                                                                                                                                                                                   //
+        }                                                                                                                                                                                              //
+        if (nullomers == 1) {                                                                                                                                                                          // In the case of nullomers, we also require specification on the
+            if (0 == (fnul = fopen(nulfname, "wb"))) {                                                                                                                                                 //   -n command line parameter; no spec, no nullomer histogram, 
+                printf("Can't open for create, file %s\n", nulfname);                                                                                                                                  //   and so no need to create the file.
+                exit(0);                                                                                                                                                                               //
+            }                                                                                                                                                                                          //
+        }                                                                                                                                                                                              //
+        if (0 == (fstt = fopen(statname, "wb"))) {                                                                                                                                                     //
+            printf("Can't open for create, file %s\n", statname);                                                                                                                                      //
+            exit(0);                                                                                                                                                                                   //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    if (*seqfname) {                                                                                                                                                                                   //
+        if (0 != (fseq = fopen(seqfname, "rb"))) {                                                                                                                                                     //
+            if (0 != fhst) {                                                                                                                                                                           // If a histogram output file exists, write the histograms to that file.
+                fprintf(fhst, "   file: %s\n\n", seqfname);                                                                                                                                            //
+            }                                                                                                                                                                                          //
+            else {                                                                                                                                                                                     //
+                printf("   file: %s\n\n", seqfname);                                                                                                                                                   //
+            }                                                                                                                                                                                          //
+            if (0 != fnul) {                                                                                                                                                                           //
+                fprintf(fnul, "   file: %s\n\n", seqfname);                                                                                                                                            //
+            }                                                                                                                                                                                          //
+            if (0 != fstt) {                                                                                                                                                                           //
+                fprintf(fstt, "   file: %s\n\n", seqfname);                                                                                                                                            //
+            }                                                                                                                                                                                          //
+            buildbytroot();                                                                                                                                                                            // Initialise the root of the "suffix tree" analog.
+            fclose(fseq);                                                                                                                                                                              //
+            loadtime = clock();                                                                                                                                                                        //
+            buildbytree(lst[0]);                                                                                                                                                                       // Build the "suffix tree" analog.
+            printf("Nullomer Histogram start\n\n");                                                                                                                                                    //
+            for (int iii = 0; iii < MAXNULLHIST; iii++) {                                                                                                                                              //
+                if (0 < hstnul[iii]) {                                                                                                                                                                 //
+                    printf("%3d %d\n", iii, hstnul[iii]);                                                                                                                                              //
+                }                                                                                                                                                                                      //
+                else {                                                                                                                                                                                 //
+                }                                                                                                                                                                                      //
+            }                                                                                                                                                                                          //
+            printf("\nNullomer Histogram stop\n\n");                                                                                                                                                   //
+            treetime = clock();                                                                                                                                                                        //
+            hsttot = 0;                                                                                                                                                                                // Compute the histogram of shustring lengths.
+            for (t = 0; t < MAXSEQUENCELENGTH; t++) hstgrm[t] = 0;                                                                                                                                     //
+            hstrjct = 0;                                                                                                                                                                               //
+            for (t = 0; t < sequenceLength; t++) {                                                                                                                                                     //
+                tt = (seqcap[t] - t);                                                                                                                                                                  //
+                if (tt < MAXSEQUENCELENGTH) hstgrm[tt]++; else hstrjct++;                                                                                                                              //
+            }                                                                                                                                                                                          //
+            printf("Shustring Histogram Data:\n========================\n\n");
+            for (t = 0; t < MAXSEQUENCELENGTH; t++) {
+                if (0 != hstgrm[t]) {
+                    printf("    %8d :: %d\n", t, hstgrm[t]);
                 }
-                printf("\n");
             }
-        }
-    }
-    if(op == 2)
-    {
-        printf("printbytnode level %d r:%08x\n",t,r);
-        for(i=0;i<256;i++)
-        {
-            if(r->cnt[i] != 0)
-            {
-                k = 0;
-                printf("%3d.%10d |",i,r->cnt[i]);
-                s = r->lst[i];
-                for(j=0;j<r->cnt[i];j++)
-                {
-                    if(k == 10)
-                    {
-                        printf("\n               |");
-                        k = 0;
-                    }
-                    printf(" %10d.%02x.%02x.%02x.%02x.%02x",s,sequen[s],sequen[s+1],sequen[s+2],sequen[s+3],sequen[s+4]);
-                    s = seqnxt[s];
-                    k++;
-                }
-                printf("\n");
-            }
-        }
-    }
-    printf("--------------\n");
-}
+            printf("\n   ===end-of-report===\n\n");
+            if (0 != fhst) {                                                                                                                                                                           // If a histogram output file exists, write the histograms to that file.
+                fprintf(fhst, SYMHSTTITLE1);                                                                                                                                                           // HISTOGRAM  -  Symbol Usage
+                fprintf(fhst, SYMHSTTITLE2);                                                                                                                                                           //
+                for (t = 0; t < 256; t++) {                                                                                                                                                            //
+                    if (257 != mux[t]) {                                                                                                                                                               //
+                        if (((31 < dmx[mux[t]]) && (dmx[mux[t]] < 127))                                                                                                                                //
+                            || (159 < dmx[mux[t]])                                                                                                                                                     //
+                            ) {                                                                                                                                                                        //
+                            fprintf(fhst, "             %c   %12d\n", dmx[mux[t]], use[mux[t]]);                                                                                                       //
+                        }                                                                                                                                                                              //
+                        else {                                                                                                                                                                         //
+                            fprintf(fhst, "             %2x   %12d\n", dmx[mux[t]], use[mux[t]]);                                                                                                      //
+                        }                                                                                                                                                                              //
+                        hsttot += use[mux[t]];                                                                                                                                                         //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //
+                fprintf(fhst, "                 ------------\n                 %12d  Total Symbols\n\n", hsttot);                                                                                      //
+                fprintf(fhst, SYMHSTFOOTER);                                                                                                                                                           //
+                if (nullomers != 0) {                                                                                                                                                                  // HISTOGRAM  -  Nullomer Lengths
+                    fprintf(fhst, NULHSTTITLE1);                                                                                                                                                       //
+                    fprintf(fhst, NULHSTTITLE2);                                                                                                                                                       //
+                    for (t = 0, hsttot = 0; t < MAXNULLHIST; t++) {                                                                                                                                    //
+                        if (hstnul[t] != 0) {                                                                                                                                                          //
+                            fprintf(fhst, "  %12d   %12d\n", t, hstnul[t]);                                                                                                                            //
+                            hsttot += hstnul[t];                                                                                                                                                       //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                    fprintf(fhst, "                 ------------\n                 %12d  Total Nullomers\n\n", hsttot);                                                                                //
+                    fprintf(fhst, NULHSTFOOTER);                                                                                                                                                       //
+                }                                                                                                                                                                                      //
+                fprintf(fhst, SHUHSTTITLE1);                                                                                                                                                           // HISTOGRAM  -  Shustring Lengths
+                fprintf(fhst, SHUHSTTITLE2);                                                                                                                                                           //
+                for (t = 0, hsttot = 0; t < MAXSEQUENCELENGTH; t++) {                                                                                                                                  // Print generated shustring lengths histogram;
+                    if (hstgrm[t] != 0) {                                                                                                                                                              // |
+                        fprintf(fhst, "  %12d   %12d\n", t, hstgrm[t]);                                                                                                                                // |
+                        hsttot += hstgrm[t];                                                                                                                                                           // |
+                    }                                                                                                                                                                                  // |
+                }                                                                                                                                                                                      // |
+                fprintf(fhst, "                 ------------\n                 %12d  Total Shustrings\n\n", hsttot);                                                                                   // |
+                fprintf(fhst, SHUHSTFINALREPORT1);                                                                                                                                                     // |
+            }                                                                                                                                                                                          // |
+            else {                                                                                                                                                                                     // else, write histograms to the terminal.
+                printf(SYMHSTTITLE1);                                                                                                                                                                  // HISTOGRAM  -  Symbol Usage
+                printf(SYMHSTTITLE2);                                                                                                                                                                  //
+                for (t = 0, hsttot = 0; t < 256; t++) {                                                                                                                                                //
+                    if (257 != mux[t]) {                                                                                                                                                               //
+                        if (((31 < dmx[mux[t]]) && (dmx[mux[t]] < 127))                                                                                                                                //
+                            || (159 < dmx[mux[t]])                                                                                                                                                     //
+                            ) {                                                                                                                                                                        //
+                            printf("            %c   %12d\n", dmx[mux[t]], use[mux[t]]);                                                                                                               //
+                        }                                                                                                                                                                              //
+                        else {                                                                                                                                                                         //
+                            printf("         <%3d>     %12d\n", dmx[mux[t]], use[mux[t]]);                                                                                                             //
+                        }                                                                                                                                                                              //
+                        hsttot += use[mux[t]];                                                                                                                                                         //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //
+                printf("                 ------------\n                 %12d  Total Symbols\n\n", hsttot);                                                                                             //
+                printf(SYMHSTFOOTER);                                                                                                                                                                  //
+                if (nullomers != 0) {                                                                                                                                                                  // HISTOGRAM  -  Nullomer Lengths
+                    printf(NULHSTTITLE1);                                                                                                                                                              //
+                    printf(NULHSTTITLE2);                                                                                                                                                              //
+                    for (t = 0, hsttot = 0; t < MAXNULLHIST; t++) {                                                                                                                                    //
+                        if (hstnul[t] != 0) {                                                                                                                                                          //
+                            printf("  %12d   %12d\n", t, hstnul[t]);                                                                                                                                   //
+                            hsttot += hstnul[t];                                                                                                                                                       //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                    printf("                 ------------\n                 %12d  Total Nullomers\n\n", hsttot);                                                                                       //
+                    printf(NULHSTFOOTER);                                                                                                                                                              //
+                }                                                                                                                                                                                      //
+                printf(SHUHSTTITLE1);                                                                                                                                                                  // HISTOGRAM  -  Shustring Lengths
+                printf(SHUHSTTITLE2);                                                                                                                                                                  //
+                for (t = 0, hsttot = 0; t < MAXSEQUENCELENGTH; t++) {                                                                                                                                  // Print generated shustring lengths histogram.
+                    if (hstgrm[t] != 0) {                                                                                                                                                              //
+                        printf("  %12d   %12d\n", t, hstgrm[t]);                                                                                                                                       //
+                        hsttot += hstgrm[t];                                                                                                                                                           //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //  NB - the writing of nullomers and collection of related histographic
+                printf("                 ------------\n                 %12d  Total Shustrings\n\n", hsttot);                                                                                          //         data is handled in the detection software - buildbytree().
+                printf(SHUHSTFINALREPORT1);                                                                                                                                                            // 
+            }                                                                                                                                                                                          //
+            if (0 != fshu) {                                                                                                                                                                           // SHUSTRINGS - write shustrings to file
+                for (t = 0; t < sequenceLength; t++) {                                                                                                                                                 //
+                    if (((31 < dmx[sequen[t]]) && (dmx[sequen[t]] < 127))                                                                                                                              //
+                        || (159 < dmx[sequen[t]])                                                                                                                                                      //
+                        ) {                                                                                                                                                                            //
+                        fprintf(fshu, OUTRPT1, t, (seqcap[t] - t), dmx[sequen[t]], dmx[sequen[t]]);                                                                                                    //  NB - the Longest Common Prefix is (seqcap[t] - t) - 1.
+                    }                                                                                                                                                                                  //
+                    else {                                                                                                                                                                             //
+                        fprintf(fshu, OUTRPT2, t, (seqcap[t] - t), dmx[sequen[t]]);                                                                                                                    //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //  NB - the Longest Common Prefix is (seqcap[t] - t) - 1.
+                fclose(fshu);                                                                                                                                                                          //
+            }                                                                                                                                                                                          //
+            else {                                                                                                                                                                                     // SHUSTRINGS - write shustrings to the terminal
+                if (qquietflag == 0) {                                                                                                                                                                 //
+                    printf("       index       length xx c\n");                                                                                                                                        //
+                    for (t = 0; t < sequenceLength; t++) {                                                                                                                                             //
+                        i = (seqcap[t] - t);                                                                                                                                                           //
+                        if (((31 < dmx[sequen[t]]) && (dmx[sequen[t]] < 127))                                                                                                                          //
+                            || (159 < dmx[sequen[t]])                                                                                                                                                  //
+                            ) {                                                                                                                                                                        //
+                            printf("%12d,%12d,%02x,   %c\n", t, i, dmx[sequen[t]], dmx[sequen[t]]);                                                                                                    //
+                        }                                                                                                                                                                              //
+                        else {                                                                                                                                                                         //
+                            printf("%12d,%12d,%02x,<%3d>\n", t, i, dmx[sequen[t]], dmx[sequen[t]]);                                                                                                    //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //
+                printf("\n\n");                                                                                                                                                                        //
+            }                                                                                                                                                                                          //
+            if (0 != fstat) {                                                                                                                                                                          //
+                unsigned int   i, j, cnt, out, total;                                                                                                                                                  //
+                         bool  good = false;                                                                                                                                                           //
+                                                                                                                                                                                                       //
+                fprintf(fstt, "\n\n   Section: Run Length Histogram  Note: (symbol, run length) -> instances\n   =============================\n\n                ");                                  //
+                printf("\n\n   Section: Run Length Histogram  Note: (symbol, run length) -> instances\n   =============================\n\n                ");                                         //
+                for (j = 1; j < 16; j++) {                                                                                                                                                             //
+                    fprintf(fstt, "%2d         ", j);                                                                                                                                                  //
+                    printf("%2d         ", j);                                                                                                                                                         //
+                }                                                                                                                                                                                      //
+                fprintf(fstt, "\n\n");                                                                                                                                                                 //
+                printf("\n\n");                                                                                                                                                                        //
+                FindRuns();                                                                                                                                                                            //
+                for (i = 0; i < 256; i++) {                                                                                                                                                            //
+                    good = false;                                                                                                                                                                      //
+                    total = 0;                                                                                                                                                                         //
+                    cnt = 0;                                                                                                                                                                           //
+                    out = 0;                                                                                                                                                                           //
+                    for (j = 0; j < MAXRUNHIST; j++) {                                                                                                                                                 //
+                        if (0 != runhst[i][j]) {                                                                                                                                                       //
+                            good = true;                                                                                                                                                               //
+                            cnt++;                                                                                                                                                                     //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                    if (good == true) {                                                                                                                                                                //
+                        fprintf(fstt, "     %02x : ", dmx[i]);                                                                                                                                         //
+                        printf("     %02x : ", dmx[i]);                                                                                                                                                //
+                        for (j = 1; j < MAXRUNHIST; j++) {                                                                                                                                             //
+                            if (0 != runhst[i][j]) {                                                                                                                                                   //
+                                total += runhst[i][j];                                                                                                                                                 //
+                                fprintf(fstt, "%8d   ", runhst[i][j]);                                                                                                                                 //
+                                printf("%8d   ", runhst[i][j]);                                                                                                                                        //
+                                cnt--;                                                                                                                                                                 //
+                                out++;                                                                                                                                                                 //
+                            }                                                                                                                                                                          //
+                            else {                                                                                                                                                                     //
+                                    fprintf(fstt, "           ");                                                                                                                                      //
+                                    printf("           ");                                                                                                                                             //
+                                    out++;                                                                                                                                                             //
+                            }                                                                                                                                                                          //
+                            if (out >= 16) {                                                                                                                                                           //
+                                break;                                                                                                                                                                 //
+                            }                                                                                                                                                                          //
+                        }                                                                                                                                                                              //
+                        fprintf(fstt, "  ::  %8d\n", total);                                                                                                                                           //
+                        printf("  ::  %8d\n", total);                                                                                                                                                  //
+                    }                                                                                                                                                                                  //
+                }                                                                                                                                                                                      //
+                fprintf(fstt, "\n       ====end=of=report====\n\n\n\n");                                                                                                                               //
+                printf("\n       ====end=of=report====\n\n\n\n");                                                                                                                                      //
+                fprintf(fstt, "Section: Groupings Histogram\n\n");                                                                                                                                     //
+                for (i = 1; i < 5; i++) {                                                                                                                                                              //
+                    switch (i) {                                                                                                                                                                       //
+                    case 1:                                                                                                                                                                            //
+                        fprintf(fstt, "       Single Pairings\n   =============================\n\n");                                                                                                 //
+                        printf("       Pairings\n   =============================\n\n");                                                                                                               //
+                        break;                                                                                                                                                                         //
+                    case 2:                                                                                                                                                                            //
+                        fprintf(fstt, "        Double Pairings\n   =============================\n\n");                                                                                                //
+                        printf("        Doubles\n   =============================\n\n");                                                                                                               //
+                        break;                                                                                                                                                                         //
+                    case 3:                                                                                                                                                                            //
+                        fprintf(fstt, "        Triples\n   =============================\n\n");                                                                                                        //
+                        printf("        Triple Pairings\n   =============================\n\n");                                                                                                       //
+                        break;                                                                                                                                                                         //
+                    case 4:                                                                                                                                                                            //
+                        fprintf(fstt, "        Quadruples\n   =============================\n\n");                                                                                                     //
+                        printf("        Quadruple Pairings\n   =============================\n\n");                                                                                                    //
+                        break;                                                                                                                                                                         //
+                    default:                                                                                                                                                                           // Report System Error!
+                        exit(0);                                                                                                                                                                       //
+                        break;                                                                                                                                                                         //
+                    }                                                                                                                                                                                  //
+                    ReportSimpleGrouping(i);                                                                                                                                                           //
+                    fprintf(fstt, "\n       ====end=of=report====\n\n\n\n");                                                                                                                           //
+                    printf("\n       ====end=of=report====\n\n\n\n");                                                                                                                                  //
+                }                                                                                                                                                                                      //
+                i = 0;                                                                                                                                                                                 //
+                j = 1000;                                                                                                                                                                              //
+                maxpair = 0;                                                                                                                                                                           //
+                printf("      Pattern Occurrence Count Map\n      ============================\n");                                                                                                    //
+                fprintf(fstt, "      Pattern Occurrence Count Map\n      ============================\n");                                                                                             //
+                for (k = 0; k < nextalias; k++) {                                                                                                                                                      //
+                    printf("          %2x", dmx[k]);                                                                                                                                                   //
+                    fprintf(fstt, "          %2x", dmx[k]);                                                                                                                                            //
+                }                                                                                                                                                                                      //
+                printf("\n\n");                                                                                                                                                                        //
+                fprintf(fstt, "\n\n");                                                                                                                                                                 //
+                for (k = 0; k < MAXSEQUENCELENGTH; k++) {                                                                                                                                              //
+                    seqcap[k] = 0;                                                                                                                                                                     //
+                }                                                                                                                                                                                      //
+                while (i < j) {                                                                                                                                                                        //
+                    for (k = 0; k < nextalias; k++) {                                                                                                                                                  //
+                        pairs[k] = 0;                                                                                                                                                                  //
+                    }                                                                                                                                                                                  //
+                    for (k = 0; k < nextalias; k++) {                                                                                                                                                  //
+                        l = (i * 10) + k;                                                                                                                                                              //
+                        //l = (i * radix) + k;                                                                                                                                                           //
+                        for (m = 0; m < sequenceLength; m++) {                                                                                                                                         //
+                            t = (unsigned int)sequen[m];                                                                                                                                               //
+                            t *= 10;                                                                                                                                                                   //
+                            t += (unsigned int)sequen[(m + 1) % sequenceLength];                                                                                                                       //
+                            t *= 10;                                                                                                                                                                   //
+                            t += (unsigned int)sequen[(m + 2) % sequenceLength];                                                                                                                       //
+                            t *= 10;                                                                                                                                                                   //
+                            //t *= radix;                                                                                                                                                                //
+                            //t += (unsigned int)sequen[(m + 1) % sequenceLength];                                                                                                                       //
+                            //t *= radix;                                                                                                                                                                //
+                            //t += (unsigned int)sequen[(m + 2) % sequenceLength];                                                                                                                       //
+                            //t *= radix;                                                                                                                                                                //
+                            t += (unsigned int)sequen[(m + 3) % sequenceLength];                                                                                                                       //
+                            if (t == l) {                                                                                                                                                              //
+                                pairs[k]++;                                                                                                                                                            //
+                            }                                                                                                                                                                          //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                    printf("   %4d :    ", i);                                                                                                                                                         //
+                    fprintf(fstt, "   %4d :    ", i);                                                                                                                                                  //
+                    for (k = 0; k < nextalias; k++) {                                                                                                                                                  //
+                        printradix(pairs[k], 6, 10);                                                                                                                                                   //
+                        printf("      ");                                                                                                                                                              //
+                        printradixf(pairs[k], 6, 10, fstt);                                                                                                                                            //
+                        fprintf(fstt, "      ");                                                                                                                                                       //
+                        seqcap[pairs[k]]++;                                                                                                                                                            //
+                        if (maxpair < pairs[k]) {                                                                                                                                                      //
+                            maxpair = pairs[k];                                                                                                                                                        //
+                        }                                                                                                                                                                              //
+                    }                                                                                                                                                                                  //
+                    printf("\n");                                                                                                                                                                      //
+                    fprintf(fstt, "\n");                                                                                                                                                               //
+                    i++;                                                                                                                                                                               //
+                }                                                                                                                                                                                      //
+                printf("\n\n\n");                                                                                                                                                                      //
+                fprintf(fstt, "\n\n\n");                                                                                                                                                               //
+                for (i = 0; i < (maxpair + 10); i++) {                                                                                                                                                 //
+                    printf("     %6d     %12d\n", i, seqcap[i]);                                                                                                                                       //
+                    fprintf(fstt, "     %6d     %12d\n", i, seqcap[i]);                                                                                                                                //
+                }                                                                                                                                                                                      //
+                fprintf(fstt, "\n       ====end=of=report====\n\n\n\n");                                                                                                                               //
+                printf("\n       ====end=of=report====\n\n\n\n");                                                                                                                                      //
+            }                                                                                                                                                                                          //
+        }                                                                                                                                                                                              //
+        else {                                                                                                                                                                                         //
+            printf("Unable to open input file:%s\n", seqfname);                                                                                                                                        //
+        }                                                                                                                                                                                              //
+    }                                                                                                                                                                                                  //
+    else {                                                                                                                                                                                             //
+        printf("Name of input file not given.\n");                                                                                                                                                     //
+    }                                                                                                                                                                                                  //
+    generatetime = clock();                                                                                                                                                                            //
+    printf(" Sequence Length:%12d\n", sequenceLength);                                                                                                                                                 //
+    printf("     alias count:%12d\n\n", nextalias);                                                                                                                                                    //
+    printf("   Start  time:%14.4f sec\n", ((float)starttime) / CLOCKS_PER_SEC);                                                                                                                        //
+    printf("   Load   time:%14.4f sec  delta:%14.4f sec\n", ((float)loadtime / CLOCKS_PER_SEC), ((float)(loadtime - starttime)) / CLOCKS_PER_SEC);                                                     //
+    printf("   Tree   time:%14.4f sec  delta:%14.4f sec\n", ((float)treetime / CLOCKS_PER_SEC), ((float)(treetime - loadtime)) / CLOCKS_PER_SEC);                                                      //
+    printf("   Report time:%14.4f sec  delta:%14.4f sec\n", ((float)generatetime / CLOCKS_PER_SEC), ((float)(generatetime - treetime)) / CLOCKS_PER_SEC);                                              //
+}                                                                                                                                                                                                      //
 
-void dumpsequen(void)
-{
-    unsigned int   i;
-
-    printf("dumpsequence len:%d",sequenceLength);
-    for(i=0;i<sequenceLength;i++)
-    {
-        if(0 == (i  % 10))
-        {
-            printf("\n %10d -",i);
-        }
-        printf(" %10d.%02x.%6d",seqnxt[i],sequen[i],seqcap[i]);
-    }
-    printf("\n");
-}
-
-void dumplistroot(bytnode * r)
-{
-    unsigned int   i;
-
-    printf("dumplistroot on %08x",r);
-    for(i=0;i<256;i++)
-    {
-        if(0 == (i%16))
-        {
-            printf("\n");
-        }
-        printf(" %3d.%10d",i,r->lst[i]);
-    }
-    printf("\n");
-}
-
-void initbytnode(bytnode * r)                                                                               //
-{                                                                                                           //
-    unsigned int   i;                                                                                       //
-                                                                                                            //
-    //printf("initbytnode  entry r:%08x\n",r);
-    r->lnk = 0;                                                                                             //
-    for(i=0;i<256;i++)                                                                                      //
-    {                                                                                                       //
-        r->lst[i] = -1;                                                                                     //
-        r->cnt[i] = 0;                                                                                      //
-    }                                                                                                       //
-}                                                                                                           //
-                                                                                                            //
-bytnode * mallocbytnode(void)                                                                               //
-{                                                                                                           //
-    bytnode * r;                                                                                            //
-                                                                                                            //
-    if((*freelist).lnk)                                                                                     //
-    {                                                                                                       //
-        r = freelist;                                                                                       //
-        freelist = (*freelist).lnk;                                                                         //
-        initbytnode(r);                                                                                     //
-        //printf("allocation is new %d nodes\n",++nodecount);
-        return(r);                                                                                          //
-    }else{                                                                                                  //
-        r = (bytnode *) malloc(sizeof(bytnode));                                                            //
-        treealloc += sizeof(bytnode);                                                                       //
-        initbytnode(r);                                                                                     //
-        //printf("allocation is now %d nodes\n",++nodecount);
-        return(r);                                                                                          //
-    }                                                                                                       //
-}                                                                                                           //
-                                                                                                            //
-void freebytnode(bytnode * r)                                                                               // r - a free bytnode
-{                                                                                                           // put the bytnode in the LIFO free list - link the newly free node to
-    r->lnk = (*freelist).lnk;                                                                               //   the list of other free nodes, by pointing at the list
-    (*freelist).lnk = r;                                                                                    // adjust the head pointer of the free list - add a new head to the list
-    //printf("free       is now %d nodes\n",--nodecount);
-}                                                                                                           //
-                                                                                                            //
-void buildbytroot(bytnode * r)                                                                              // r - an initialised, empty bytnode
-{                                                                                                           //
-    unsigned int    i;                                                                                      // i - an index on the sequence
-    unsigned char   c;                                                                                      // c - the i'th character of the sequence
-    //unsigned int    j;
-                                                                                                            //
-    //printf("buildbytroot entry r:%08x\n",r);
-    initbytnode(r);                                                                                         // initialise the bytnode r                                                                   Redistribute the indicies of the elements of a list based upon the next character of the element.
-    fseek(seq,0L,SEEK_SET);                                                                                 // seek to beginning of sequence
-    for(i=0;i<MAXSEQUENCELENGTH;i++)                                                                        //
-    {                                                                                                       //
-        seqnxt[i] = -1;                                                                                     //
-    }                                                                                                       //
-    i = 0;                                                                                                  //
-    //j = 16;
-    while(1)                                                                                                // while symbols remain to be read from the sequence
-    {                                                                                                       //
-        //if(j == 16)
-        //{
-        //    printf("\n   ");
-        //    j = 0;
-        //}
-        c = fgetc(seq);                                                                                     // get the next symbol of the sequence
-        if(feof(seq))                                                                                       // NB - all files (in the real world) are of finite size
-        {                                                                                                   //    - hence, the forever loop must eventually execute the following block:
-            sequenceLength = i;                                                                             //   note the sequence length
-            //printf("\n");
-            //printbytnode(r,5000,2);
-            //dumplistroot(r);
-            //printf("buildbytroot exit %d\n",i);
-            return;                                                                                         //   exit the routine
-        }                                                                                                   //
-        seqnxt[i] = r->lst[(unsigned int)c];                                                                // build a list of backward pointers, and so
-        r->lst[(unsigned int)c] = i;                                                                        //   group the symbols by character
-        r->cnt[(unsigned int)c]++;                                                                          // increment the character count
-        seqcap[i] = i;                                                                                      // set initial length of cap to zero
-        sequen[i] = c;                                                                                      // add character to sequence
-        //printf(" %6d.%02x",i,c);
-        i++;                                                                                                // keep track of the sequence length (count of symbols in sequence)
-        //j++;
-    }
-}
-                                                                                                            //
-void buildbytnode(bytnode * r, unsigned int t){                                                             // r    - an as-yet-unused bytnode                                                            Sort a subsequence t into node r - the list of elements of the subsequence are linked via seqnxt[].
-                                                                                                            // t    - is the index of a sortable subsequence                                              The elements of a subsequence generally are discontiguous with respect to the locus in the sequence
-    unsigned int   hold;                                                                                    // hold - keeps track of the next index in the sortable subsequence!                            at which these elements are found.
-    unsigned int   s,p = 1;                                                                                 // s    - surrogate, to make code more readable (a sign-extended UINT32)
-                                                                                                            //
-    //printf("buildbytnode entry r:%08x\n",r);
-    initbytnode(r);                                                                                         // initialise the bytnode r                                                                   Redistribute the indicies of the elements of a list based upon the next character of the element.
-    //dumplistroot(r);
-    while(t != -1)                                                                                          //
-    {                                                                                                       //
-        if((seqcap[t] - t) < sequenceLength)                                                                //
-        {                                                                                                   // no cap can exceed the length of the entire sequence
-            hold = seqnxt[t];                                                                               // hold the index to the next element of the subsequence
-            seqcap[t]++;                                                                                    // increase the cap length of subsequence t
-            if(seqcap[t] < sequenceLength)                                                                  //
-            {                                                                                               // if the cap length of subsequence t is less than the length of the entire sequence          The cap is a length plus the index of the cap.  It may easily in value exceed the sequenceLength, and
-                s = (unsigned int) sequen[seqcap[t]];                                                       //   then we need make no adjustment to that cap length in order to use it as an index          this fact must be taken into account when conducting the sort.
-                seqnxt[t] = r->lst[s];                                                                      // add the subsequence to the list that corresponds to the symbol that is found at the
-                r->lst[s] = t;                                                                              //   end of the subsequence - via the element found at the cap of that subsequence
-                r->cnt[s]++;                                                                                // keep track of how many subsequences are in that s list
-            }else{                                                                                          //
-                s = (unsigned int) sequen[(seqcap[t] - sequenceLength)];                                    // if the cap length of the subsequence t is greater than or equal to the length of the       This is the case where the cap plus the index of the cap (the sum) has a value that is larger than is 
-                seqnxt[t] = r->lst[s];                                                                      //   entire sequence, then we need to make an adjustment to the cap length in order to          the value of the sequenceLength.
-                r->lst[s] = t;                                                                              //   use it as an index; add the subsequence to the list that corresponds to the symbol
-                r->cnt[s]++;                                                                                //   that is found at the end of the subsequence - indicated by the element found at the
-            }                                                                                               //   cap of that subsequence; keep track of how many subsequences are in that s list
-            t = hold;                                                                                       //
-        }else{                                                                                              //
-            t = seqnxt[t];                                                                                  //
-        }                                                                                                   //
-    }                                                                                                       //
-    //printbytnode(r,5001,2);
-    //dumplistroot(r);
-    //printf("buildbytnode exit\n");
-}                                                                                                           //
-                                                                                                            //
-void buildbytree(bytnode * r,unsigned int level){                                                           // r     - a previously-populated bytnode                                                     This routine is constructed in state-machine format, and is recursively called.
-                                                                                                            // level - the depth of the current node within the suffix tree
-    unsigned int   i;                                                                                       // i     - general index, ranges over all 256 byte values                                                                                            
-      signed int   nzi = -1;       /* not zero index   */                                                   // nzi   - index to the list of the last symbol having at least one element in that list        NB - generate here, in this routine, reports respecting missing shustrings.   
-    unsigned int   nzc = 0;        /* not zero count   */                                                   // nzc   - number of lists that have at least one element in that list                                
-    unsigned int   bbts = START;   /* buildbytreestate */                                                   // bbts  - the state of the machine                                                                   
-    bytnode      * s;                                                                                       // s     - pointer to new bytnode - facilitates recursive call
-                                                                                                            //
-    //printf("buildbytree  entry @ level %d\n",level);
-    while(1)                                                                                                // while not done - being done is equivalent to reaching the NEXT state, when only one        
-    {
-        //printf("top %1d \n",bbts);
-        switch(bbts)                                                                                        //   element is in the only list that has any elements, or by reaching an error state         
-        {                                                                                                   //
-            case START:                                                                                     //
-                        //printf("START\n");
-                        for(i=0;i<256;i++)                                                                  // for each symbol in the ASCII character set - each byte value, [0..255]                     Determine the number of characters for which the corresponding symbol_list is not of length zero.
-                        {                                                                                   //
-                            //if(r->cnt[i] != 0)
-                            //{
-                            //    printf("     %3d %6d | ",i,r->cnt[i]);
-                            //    rl = r->lst[i];
-                            //    for(j=0;j<r->cnt[i];j++)
-                            //    {
-                            //        printf("%10d ",rl);
-                            //        rl = seqnxt[rl];
-                            //        if(15 == (j % 16))
-                            //        {
-                            //            printf("\n                | ");
-                            //        }
-                            //    }
-                            //    printf("\n\n");
-                            //}
-                            if(r->cnt[i] > 1)                                                               //   count up the number of symbols for which the list_count is more than one
-                            {                                                                               //
-                                nzc++;                                                                      //
-                                nzi = i;                                                                    //   and keep track of which symbol last reported a list_count of more than one
-                            }                                                                               //
-                        }                                                                                   //
-                        if(nzc == 1)                                                                        // if only one symbol has a not_zero list_count, then this node can be re-used,               Detect and service the special state of all symbols appearing in one list
-                        {                                                                                   //   and so the symbols in that one list may be resorted on the current node;                   versus the expected state of symbols appearing in more than one list.
-                            bbts = AGAIN;                                                                   //   else, for the case of only one symbol in one list, we are done (nothing to               For AGAIN state, no need to allocate new node; simply resort the list on the current node.
-                        }else{                                                                              //   otherwise,                                                                               For the case of more than one list containing substrings,                                                            
-                            if(nzc > 1)                                                                     //   where more than one bucket has a list_count greater than one,                              and given a reasonable state for the node (some number of nodes greater than one have non-empty lists),
-                            {                                                                               //
-                                bbts = NEXT;                                                                //   a new node must be built                                                                 we need to sort each non_empty list upon a new node, at depth node_depth + 1.
-                            }else{                                                                          //   and, where no bucket has a list_count greater than one,                                  
-                                //printf("found leaf node\n");
-                                return;                                                                     //   we are done with this node                                                                
-                            }                                                                               //
-                        }                                                                                   //
-                        break;                                                                              //
-                                                                                                            //
-            case AGAIN:                                                                                     //
-                        //printf("AGAIN==============================\n");
-                        buildbytnode(r, r->lst[nzi]);                                                       // we re-sort the node without recursion when only one list of the node has elements          Re-sorting a node occurs when buildbytnode() is called a second or subsequent time for any one invocation 
-                        //dumpsequen();
-                        //printbytnode(r,level,1);
-                        bbts = START;                                                                       //                                                                                              of buildbytree() - called within that single invocation.
-                        nzc = 0;                                                                            // reset the counter to zero, so as to facilitate generation of a correct, new total
-                        break;                                                                              //
-                                                                                                            //
-            case  NEXT:                                                                                     //
-                        //printf("NEXT \n");
-                        s = mallocbytnode();                                                                // when there are at least two nodes with elements (even if they are both single 
-                        for(i=0;i<256;i++)                                                                  //   elements) then we need to sort each list in a new node.  So, for each character 
-                        {                                                                                   //
-                            if(r->cnt[i] > 1)                                                               //   amongst the elements, we see if the corresponding count is greater than one, and 
-                            {                                                                               //
-                                buildbytnode(s, r->lst[i]);                                                 //   if so, we build a new node (buildbytnode) and then complete the tree (buildbytree).
-                                buildbytree(s, level + 1);                                                  //
-                                //dumpsequen();
-                            }                                                                               //
-                        }                                                                                   //
-                        freebytnode(s);                                                                     // after the node is serviced, we may free it, as it will otherwise serve no useful 
-                        return;                                                                             //   purpose.
-                                                                                                            //
-            default:    break;                                                                              // report error condition - we should never get to the default case.
-        }                                                                                                   //
-    }                                                                                                       //
-}                                                                                                           //
-                                                                                                            //
-int main( int argc, char *argv[], char **envp){                                                             //
-    unsigned int   t,tt;                                                                                    //
-    unsigned int   i;                                                                                       //
-                                                                                                            //
-    starttime = clock();                                                                                    //
-    freelist = (bytnode *) malloc(sizeof(bytenode));                                                        //
-    initbytnode(freelist);                                                                                  //
-    //dumplistroot(freelist);
-    copyright();                                                                                            //
-    for(i=0;i<257;i++) *(seqfname+i) = *(rptfname+i) = *(outfname+i) = '\0';                                //
-    while(1){                                                                                               //
-        int c = getopt(argc, argv, "-ahjklmnsf:o:t:");                                                      //
-        if(c == -1) break;                                                                                  //
-		switch(c){                                                                                          //
-            case 'a':                                                                                       //
-                about();                                                                                    //
-                exit(0);                                                                                    //
-            case 'b':                                                                                       // The cardinality of the symbol set S; i.e.,  || S || 
-                break;                                                                                      //
-            case 'c':                                                                                       // Coloring count for deviant generation in UDS; number of random single symbol substitutions
-                break;                                                                                      //
-            case 'd':                                                                                       //
-                break;                                                                                      //
-            case 'e':                                                                                       //
-                break;                                                                                      //
-            case 'f':                                                                                       //
-                break;                                                                                      //
-            case 'g':                                                                                       //
-                break;                                                                                      //
-			case 'h':                                                                                       //
-                help();                                                                                     //
-                exit(0);                                                                                    //
-            case 'i':                                                                                       // 
-                break;                                                                                      //
-            case 'j':                                                                                       //
-                histogramflag = 1;                                                                          //
-                break;                                                                                      //
-            case 'k':                                                                                       //
-                kindflag = arg_to_int(optarg, 0, 0, 0, 0);                                                  //
-                if((kindflag < 0) || (kindflag > 1)){                                                       //
-                    printf("Invalid histogram type code\n");                                                //
-                    exit(0);}                                                                               //
-                break;                                                                                      //
-            case 'l':                                                                                       //
-                license();                                                                                  //
-                exit(0);                                                                                    //
-            case 'm':                                                                                       //
-                exit(0);                                                                                    //
-                break;                                                                                      //
-            case 'n':                                                                                       //
-                notfound = 1;                                                                               //
-                break;                                                                                      //
-			case 'o':                                                                                       //
-                strcpy(outfname,optarg);                                                                    //
-                break;                                                                                      //
-            case 'p':                                                                                       //
-                break;                                                                                      //
-            case 'q':                                                                                       //
-                break;                                                                                      //
-            case 'r':                                                                                       // Option for repeat and replace operations
-                break;                                                                                      // replace output file
-            case 's':                                                                                       // Shuffle a Uniformly Disordered Sequence
-                symbollistflag = 1;                                                                         //
-                break;                                                                                      //
-            case 't':                                                                                       //
-                threshold = arg_to_int(optarg, 0, 0, 0, 0);                                                 //
-                thresholdflag = 1;                                                                          //
-                break;                                                                                      //
-            case 'u':                                                                                       //
-                break;                                                                                      //
-			case 'v':                                                                                       //
-                break;                                                                                      //
-            case 'w':                                                                                       //
-                break;                                                                                      //
-            case 'x':                                                                                       //
-                break;                                                                                      //
-            case 'y':                                                                                       //
-                break;                                                                                      //
-            case 'z':                                                                                       //
-                break;                                                                                      //
-			case   1:                                                                                       //
-                strcpy(seqfname,optarg);                                                                    //
-                break;                                                                                      //
-			default:                                                                                        //
-                break;}}                                                                                    //
-    if(*seqfname){                                                                                          //
-        if(0 != (seq = fopen(seqfname,"rb"))){                                                              //
-            bytree = (bytnode *)malloc(sizeof(bytnode));                                                    //
-            //initbytnode(bytree);                                                                            // Initialise the state of a bytnode
-            //printf("BuildRoot on %s\n",seqfname);                                                           //
-            buildbytroot(bytree);                                                                           //
-            //dumpsequen();
-            //dumplistroot(bytree);
-            loadtime = clock();                                                                             //
-            //printf("BuildTree\n");                                                                          //
-            buildbytree(bytree,1);                                                                          //
-            //dumpsequen();
-            treetime = clock();                                                                             //
-            fclose(seq);                                                                                    //
-            //printf("Generate Report\n");                                                                    //
-            if(histogramflag == 1){                                                                         // This histogram service is for post processing of generated UDS, Permutation and Shustrings.
-                hsttot = 0;                                                                                 //
-                for(t=0;t<MAXSEQUENCELENGTH;t++){                                                           // Ideally, this is governed by cardiality of the symbol set; i.e., ||S||
-                    hstgrm[t] = 0;}                                                                         //
-                hstrjct = 0;                                                                                //
-                printf(HSTTITLE1);                                                                          //
-                printf(HSTTITLE2);                                                                          //
-                for(t=0;t<sequenceLength;t++){                                                              //
-                    tt = (seqcap[t] - t) + 1;                                                               //
-                    if(tt < MAXSEQUENCELENGTH){                                                             //
-                        hstgrm[tt]++;                                                                       //
-                    }else{                                                                                  //
-                        hstrjct++;}}                                                                        //
-                for(t=0;t<MAXSEQUENCELENGTH;t++){                                                           // Print generated histogram
-                    if(hstgrm[t] != 0){                                                                     //
-                        printf("  %12d   %12d\n",t,hstgrm[t]);                                              //
-                        hsttot += hstgrm[t];}}                                                              //
-                printf(HSTFINALREPORT1);                                                                    //
-            }else{                                                                                          //
-                if(*outfname){                                                                              //
-                    if(0 != (rpt = fopen(outfname,"w"))){                                                   //
-                        for(t=0;t<sequenceLength;t++){                                                      //
-                            fprintf(rpt,"%12d,%12d,%c\n",t,(1 + (seqcap[t] - t)),sequen[t]);}               //
-                        fclose(rpt);                                                                        //
-                    }else{                                                                                  //
-                        printf("Error opening output file:.%s.\n",rptfname);}                               //
-                }else{                                                                                      //
-                    for(t=0;t<sequenceLength;t++){                                                          //
-                        i = (seqcap[t] - t) + 1;                                                            //
-                        if(threshold){                                                                      //
-                            if(threshold < (signed int)i){                                                  //
-                                printf("%12d,%12d,%c\n",t,i,sequen[t]);}                                    //
-                        }else{                                                                              //
-                            printf("%12d,%12d,%c\n",t,i,sequen[t]);}}                                      //
-                    printf("\n\n");}}                                                                       //
-        }else{                                                                                              //
-            printf("Unable to open input file:%s\n",seqfname);}                                             //
-    }else{                                                                                                  //
-        printf("Name of input file not given.\n");}                                                         //
-    generatetime = clock();                                                                                 //
-    endtime = clock();                                                                                      //
-    printf(" Sequence Length:%12d\n",sequenceLength);                                                       //
-    printf("     Start  time:%12d\n",starttime);                                                            //
-    printf("     Load   time:%12d\n",loadtime);                                                             //
-    printf("     Tree   time:%12d\n",treetime);                                                             //
-    printf("     Report time:%12d\n",generatetime);                                                         //
-    printf("     Stop   time:%12d\n\n",endtime);                                                            //
-    printf("       treealloc:%12ld\n",treealloc);                                                           //
-    printf("sizeof(treenode):%12d\n\n\n",sizeof(bytnode));}                                                 //
-                        
  
+
